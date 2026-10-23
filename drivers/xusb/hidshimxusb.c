@@ -2,9 +2,6 @@
  * hidshim XUSB pad: a UMDF2 function driver that xinput1_4 and
  * Windows.Gaming.Input find through the XUSB device interface.
  *
- * Derived from HIDMaestro driver/companion.c (MIT, see NOTICE). The XUSB
- * reply layouts come from there; see HIDMaestro docs/INTERNALS.md.
- *
  * The SDK opens the control interface and sends reports. The XUSB interface
  * is enabled only while that control handle is open, so the pad exists for
  * XInput exactly as long as its owner does.
