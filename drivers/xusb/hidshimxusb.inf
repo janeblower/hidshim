@@ -59,6 +59,7 @@ UmdfService              = hidshimxusb, Pad_UmdfService
 UmdfServiceOrder         = hidshimxusb
 UmdfFileObjectPolicy     = AllowNullAndUnknownFileObjects
 UmdfKernelModeClientPolicy = AllowKernelModeClients
+UmdfImpersonationLevel   = Impersonation
 
 [Pad_UmdfService]
 UmdfLibraryVersion = 2.15.0

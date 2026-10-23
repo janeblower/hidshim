@@ -72,6 +72,6 @@ Invoke-Tool (Join-Path $bin 'cl.exe') @(
 Invoke-Tool (Join-Path $bin 'link.exe') @(
     '/nologo', '/DLL', '/MACHINE:X64', '/DEBUG', '/OPT:REF', '/OPT:ICF',
     "/OUT:$out\hidshimxusb.dll", "/PDB:$out\hidshimxusb.pdb",
-    "$out\hidshimxusb.obj", 'WdfDriverStubUm.lib', 'ntdll.lib', 'kernel32.lib')
+    "$out\hidshimxusb.obj", 'WdfDriverStubUm.lib', 'ntdll.lib', 'kernel32.lib', 'advapi32.lib')
 Copy-Item -Force (Join-Path $src 'hidshimxusb.inf') $out
 Write-Host "Built $out"

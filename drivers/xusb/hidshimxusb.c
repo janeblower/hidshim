@@ -17,7 +17,6 @@
 
 DRIVER_INITIALIZE DriverEntry;
 EVT_WDF_DRIVER_DEVICE_ADD PadDeviceAdd;
-EVT_WDF_DEVICE_SELF_MANAGED_IO_INIT PadSelfManagedIoInit;
 EVT_WDF_DEVICE_FILE_CREATE PadFileCreate;
 EVT_WDF_FILE_CLEANUP PadFileCleanup;
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL PadIoControl;
@@ -43,8 +42,10 @@ static const GUID CONTROL_GUID = HIDSHIM_CONTROL_GUID_INIT;
 #define PAD_PID 0x028E
 
 typedef struct {
-    /* Serializes ownership changes with the interface state that follows them. */
+    /* Serializes ownership changes with the interface state that follows
+     * them, and guards XusbCreated. */
     WDFWAITLOCK OwnerLock;
+    BOOLEAN XusbCreated;
     /* Guards everything below. */
     WDFWAITLOCK Lock;
     WDFFILEOBJECT Owner;
@@ -76,11 +77,6 @@ NTSTATUS PadDeviceAdd(_In_ WDFDRIVER Driver, _Inout_ PWDFDEVICE_INIT DeviceInit)
     PAD_CTX *ctx;
     UNREFERENCED_PARAMETER(Driver);
 
-    WDF_PNPPOWER_EVENT_CALLBACKS pnp;
-    WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&pnp);
-    pnp.EvtDeviceSelfManagedIoInit = PadSelfManagedIoInit;
-    WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &pnp);
-
     WDF_FILEOBJECT_CONFIG fileConfig;
     WDF_FILEOBJECT_CONFIG_INIT(&fileConfig, PadFileCreate, WDF_NO_EVENT_CALLBACK, PadFileCleanup);
     WDF_OBJECT_ATTRIBUTES fileAttrs;
@@ -110,19 +106,25 @@ NTSTATUS PadDeviceAdd(_In_ WDFDRIVER Driver, _Inout_ PWDFDEVICE_INIT DeviceInit)
     status = WdfIoQueueCreate(device, &queueConfig, WDF_NO_OBJECT_ATTRIBUTES, &ctx->WaitQueue);
     if (!NT_SUCCESS(status)) return status;
 
-    status = WdfDeviceCreateDeviceInterface(device, &XUSB_GUID, NULL);
-    if (!NT_SUCCESS(status)) return status;
-
     UNICODE_STRING reference;
     RtlInitUnicodeString(&reference, HIDSHIM_CONTROL_REFERENCE);
+    status = WdfDeviceCreateDeviceInterface(device, &CONTROL_GUID, &reference);
+    if (!NT_SUCCESS(status)) return status;
+    RtlInitUnicodeString(&reference, HIDSHIM_ADMIN_REFERENCE);
     return WdfDeviceCreateDeviceInterface(device, &CONTROL_GUID, &reference);
 }
 
-/* The framework enables every interface when the device starts; the pad
- * stays hidden until a control handle claims it. */
-NTSTATUS PadSelfManagedIoInit(_In_ WDFDEVICE Device)
+/* The XUSB interface is created on the first claim rather than here: the
+ * framework enables interfaces at start, which would show the pad for a
+ * moment without an owner. */
+static NTSTATUS EnableXusb(WDFDEVICE Device, PAD_CTX *ctx)
 {
-    WdfDeviceSetDeviceInterfaceState(Device, &XUSB_GUID, NULL, FALSE);
+    if (!ctx->XusbCreated) {
+        NTSTATUS status = WdfDeviceCreateDeviceInterface(Device, &XUSB_GUID, NULL);
+        if (!NT_SUCCESS(status)) return status;
+        ctx->XusbCreated = TRUE;
+    }
+    WdfDeviceSetDeviceInterfaceState(Device, &XUSB_GUID, NULL, TRUE);
     return STATUS_SUCCESS;
 }
 
@@ -222,7 +224,12 @@ VOID PadFileCreate(_In_ WDFDEVICE Device, _In_ WDFREQUEST Request, _In_ WDFFILEO
     }
     WdfWaitLockRelease(ctx->Lock);
     if (NT_SUCCESS(status)) {
-        WdfDeviceSetDeviceInterfaceState(Device, &XUSB_GUID, NULL, TRUE);
+        status = EnableXusb(Device, ctx);
+        if (!NT_SUCCESS(status)) {
+            WdfWaitLockAcquire(ctx->Lock, NULL);
+            ctx->Owner = NULL;
+            WdfWaitLockRelease(ctx->Lock);
+        }
     }
     WdfWaitLockRelease(ctx->OwnerLock);
     WdfRequestComplete(Request, status);
@@ -295,6 +302,30 @@ static VOID HandleWaitForInput(PAD_CTX *ctx, WDFREQUEST Request)
     WdfRequestComplete(Request, status);
 }
 
+static VOID CheckAdmin(_In_ WDFREQUEST Request, _In_opt_ PVOID Context)
+{
+    BYTE sid[SECURITY_MAX_SID_SIZE];
+    DWORD size = sizeof(sid);
+    BOOL member = FALSE;
+    UNREFERENCED_PARAMETER(Request);
+    if (CreateWellKnownSid(WinBuiltinAdministratorsSid, NULL, sid, &size)) {
+        CheckTokenMembership(NULL, sid, &member);
+    }
+    *(BOOLEAN *)Context = member ? TRUE : FALSE;
+}
+
+/* Uninstall: failing the device makes PnP remove it as unplugged. An orderly
+ * removal would be vetoed by WGI clients, which keep their handles open
+ * through a query-remove, and leave the removal pending a reboot. */
+static VOID HandleRemove(WDFDEVICE Device, WDFREQUEST Request)
+{
+    BOOLEAN admin = FALSE;
+    NTSTATUS status = WdfRequestImpersonate(Request, SecurityImpersonation, CheckAdmin, &admin);
+    if (NT_SUCCESS(status) && !admin) status = STATUS_ACCESS_DENIED;
+    WdfRequestComplete(Request, status);
+    if (NT_SUCCESS(status)) WdfDeviceSetFailed(Device, WdfDeviceFailedNoRestart);
+}
+
 static VOID HandleGetCapabilities(WDFREQUEST Request)
 {
     /* Two layouts measured against a physical wired pad's xusb22: 24 bytes,
@@ -356,6 +387,10 @@ VOID PadIoControl(
 
     case IOCTL_HIDSHIM_SET_REPORT:
         HandleSetReport(ctx, Request);
+        break;
+
+    case IOCTL_HIDSHIM_REMOVE:
+        HandleRemove(WdfIoQueueGetDevice(Queue), Request);
         break;
 
     case IOCTL_XUSB_GET_INFORMATION: {

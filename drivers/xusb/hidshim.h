@@ -13,11 +13,16 @@
 
 /* Distinguishes control opens from XInput opens of the same device. */
 #define HIDSHIM_CONTROL_REFERENCE L"ctl"
+/* Reaches the device without claiming the pad, for IOCTL_HIDSHIM_REMOVE. */
+#define HIDSHIM_ADMIN_REFERENCE L"admin"
 
 #define IOCTL_HIDSHIM_GET_VERSION \
     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_HIDSHIM_SET_REPORT \
     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+/* Administrators only; the driver checks the caller's token. */
+#define IOCTL_HIDSHIM_REMOVE \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 
 typedef struct {
     ULONG Version;
