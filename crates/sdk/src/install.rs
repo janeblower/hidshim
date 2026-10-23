@@ -114,6 +114,12 @@ impl Stage {
 
 impl Drop for Stage {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
+        // Antivirus scanners briefly hold the freshly written driver files.
+        for _ in 0..20 {
+            if std::fs::remove_dir_all(&self.dir).is_ok() || !self.dir.exists() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 }
