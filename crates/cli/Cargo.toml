@@ -1,0 +1,14 @@
+[package]
+name = "hidshim-cli"
+description = "Installs hidshim and checks the pad through XInput and Windows.Gaming.Input"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "hidshim"
+path = "src/main.rs"
+
+[dependencies]
+hidshim.workspace = true
+windows = { version = "0.62.2", features = ["Gaming_Input", "Foundation_Collections"] }
+windows-sys = { workspace = true, features = ["Win32_UI_Input_XboxController"] }
