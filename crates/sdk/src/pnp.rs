@@ -1,18 +1,27 @@
-//! The pad's root devnode and the driver packages behind it.
+//! The pad's devnode and the driver packages behind it.
 
-use crate::win::{check, cr, wide};
-use std::ffi::OsString;
+use crate::win::{check, cr, hr, wide};
+use std::ffi::{OsString, c_void};
 use std::io;
 use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
+use std::sync::mpsc::{Sender, channel};
+use std::time::Duration;
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::*;
+use windows_sys::Win32::Devices::Enumeration::Pnp::*;
 use windows_sys::Win32::Devices::Properties::{DEVPKEY_Device_DriverInfPath, DEVPROPTYPE};
 use windows_sys::Win32::Foundation::{ERROR_NO_MORE_ITEMS, GetLastError, INVALID_HANDLE_VALUE};
-use windows_sys::core::w;
+use windows_sys::core::{GUID, HRESULT, PCWSTR, w};
 
-const DEVICE_NAME: &str = "HIDSHIM_XUSB";
-const HARDWARE_ID: &str = "ROOT\\HIDSHIM_XUSB";
+const ENUMERATOR: PCWSTR = w!("HIDSHIM");
+const INSTANCE: PCWSTR = w!("XUSB");
+const HARDWARE_ID: &str = "SWD\\HIDSHIM_XUSB";
+/// Devnodes of builds that used a root-enumerated device.
+const LEGACY_HARDWARE_ID: &str = "ROOT\\HIDSHIM_XUSB";
+/// GameInput groups device interfaces by ContainerId; a root devnode only
+/// gets the shared sentinel, which folds the pad into unrelated devices.
+const CONTAINER_ID: GUID = GUID::from_u128(0x6a3e5f71_2c8d_4b9a_9e14_5d7c3b2a1f80);
 const PROVIDER: &str = "hidshim";
 pub(crate) const CATALOG: &str = "hidshimxusb.cat";
 
@@ -32,10 +41,10 @@ fn devinfo() -> SP_DEVINFO_DATA {
     }
 }
 
-/// Root devnodes carrying our hardware ID, present or not.
-fn our_devices() -> io::Result<(DeviceSet, Vec<SP_DEVINFO_DATA>)> {
+/// Devnodes carrying one of our hardware IDs, present or not.
+fn our_devices(ids: &[&str]) -> io::Result<(DeviceSet, Vec<SP_DEVINFO_DATA>)> {
     // SAFETY: plain query; the handle is owned by DeviceSet.
-    let set = unsafe { SetupDiGetClassDevsW(&GUID_DEVCLASS_SYSTEM, w!("ROOT"), null_mut(), 0) };
+    let set = unsafe { SetupDiGetClassDevsW(&GUID_DEVCLASS_SYSTEM, null(), null_mut(), 0) };
     if set == INVALID_HANDLE_VALUE as HDEVINFO {
         return Err(io::Error::last_os_error());
     }
@@ -51,7 +60,7 @@ fn our_devices() -> io::Result<(DeviceSet, Vec<SP_DEVINFO_DATA>)> {
             }
             return Err(io::Error::last_os_error());
         }
-        let mut ids = [0u16; 512];
+        let mut buf = [0u16; 512];
         // SAFETY: the buffer size is passed in bytes.
         let ok = unsafe {
             SetupDiGetDeviceRegistryPropertyW(
@@ -59,12 +68,13 @@ fn our_devices() -> io::Result<(DeviceSet, Vec<SP_DEVINFO_DATA>)> {
                 &data,
                 SPDRP_HARDWAREID,
                 null_mut(),
-                ids.as_mut_ptr().cast(),
-                size_of_val(&ids) as u32,
+                buf.as_mut_ptr().cast(),
+                size_of_val(&buf) as u32,
                 null_mut(),
             )
         };
-        if ok != 0 && first_string(&ids).eq_ignore_ascii_case(HARDWARE_ID) {
+        let id = first_string(&buf);
+        if ok != 0 && ids.iter().any(|ours| id.eq_ignore_ascii_case(ours)) {
             found.push(data);
         }
     }
@@ -76,49 +86,90 @@ fn first_string(buf: &[u16]) -> String {
     String::from_utf16_lossy(&buf[..end])
 }
 
+/// Creates the pad's software devnode, which outlives this process.
 pub(crate) fn ensure_device() -> io::Result<()> {
-    if !our_devices()?.1.is_empty() {
+    if !our_devices(&[HARDWARE_ID])?.1.is_empty() {
         return Ok(());
     }
-    // SAFETY: the handle is owned by DeviceSet.
-    let set = DeviceSet(unsafe { SetupDiCreateDeviceInfoList(&GUID_DEVCLASS_SYSTEM, null_mut()) });
-    if set.0 == INVALID_HANDLE_VALUE as HDEVINFO {
-        return Err(io::Error::last_os_error());
-    }
-    let mut data = devinfo();
-    let name = wide(DEVICE_NAME);
-    let mut ids = wide(HARDWARE_ID);
-    ids.push(0);
-    // SAFETY: strings are NUL-terminated; the hardware ID is a multi-sz
-    // whose size is passed in bytes.
-    unsafe {
-        check(SetupDiCreateDeviceInfoW(
-            set.0,
-            name.as_ptr(),
-            &GUID_DEVCLASS_SYSTEM,
-            null(),
-            null_mut(),
-            DICD_GENERATE_ID,
-            &mut data,
-        ))?;
-        check(SetupDiSetDeviceRegistryPropertyW(
-            set.0,
-            &mut data,
-            SPDRP_HARDWAREID,
-            ids.as_ptr().cast(),
-            (ids.len() * 2) as u32,
-        ))?;
-        check(SetupDiCallClassInstaller(DIF_REGISTERDEVICE, set.0, &data))
-    }
+    let device = SoftwareDevice::create()?;
+    // SAFETY: the handle came from SwDeviceCreate.
+    hr(unsafe { SwDeviceSetLifetime(device.0, SWDeviceLifetimeParentPresent) })
 }
 
 pub(crate) fn remove_devices() -> io::Result<()> {
-    let (set, devices) = our_devices()?;
+    // Reattaching hands the persistent devnode back to a handle, whose
+    // close then removes it for good.
+    if !our_devices(&[HARDWARE_ID])?.1.is_empty() {
+        let device = SoftwareDevice::create()?;
+        // SAFETY: the handle came from SwDeviceCreate.
+        hr(unsafe { SwDeviceSetLifetime(device.0, SWDeviceLifetimeHandle) })?;
+    }
+    let (set, devices) = our_devices(&[HARDWARE_ID, LEGACY_HARDWARE_ID])?;
     for data in devices {
         // SAFETY: data belongs to set.
         check(unsafe { DiUninstallDevice(null_mut(), set.0, &data, 0, null_mut()) })?;
     }
     Ok(())
+}
+
+struct SoftwareDevice(HSWDEVICE);
+
+impl SoftwareDevice {
+    fn create() -> io::Result<Self> {
+        let mut ids = wide(HARDWARE_ID);
+        ids.push(0);
+        let info = SW_DEVICE_CREATE_INFO {
+            cbSize: size_of::<SW_DEVICE_CREATE_INFO>() as u32,
+            pszInstanceId: INSTANCE,
+            pszzHardwareIds: ids.as_ptr(),
+            pContainerId: &CONTAINER_ID,
+            CapabilityFlags: (SWDeviceCapabilitiesSilentInstall
+                | SWDeviceCapabilitiesDriverRequired) as u32,
+            pszDeviceDescription: w!("hidshim XInput pad"),
+            ..Default::default()
+        };
+        let (sender, receiver) = channel::<HRESULT>();
+        let mut handle = null_mut();
+        // SAFETY: info and its strings outlive the call; the sender outlives
+        // the callback, which runs before the receive below returns or never.
+        hr(unsafe {
+            SwDeviceCreate(
+                ENUMERATOR,
+                w!("HTREE\\ROOT\\0"),
+                &info,
+                0,
+                null(),
+                Some(on_created),
+                (&raw const sender).cast(),
+                &mut handle,
+            )
+        })?;
+        let device = Self(handle);
+        match receiver.recv_timeout(Duration::from_secs(30)) {
+            Ok(code) => hr(code).map(|()| device),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "software device creation timed out",
+            )),
+        }
+    }
+}
+
+impl Drop for SoftwareDevice {
+    fn drop(&mut self) {
+        // SAFETY: the handle came from SwDeviceCreate.
+        unsafe { SwDeviceClose(self.0) };
+    }
+}
+
+unsafe extern "system" fn on_created(
+    _device: HSWDEVICE,
+    result: HRESULT,
+    context: *const c_void,
+    _instance: PCWSTR,
+) {
+    // SAFETY: context is the Sender that SoftwareDevice::create keeps alive.
+    let _ = unsafe { &*context.cast::<Sender<HRESULT>>() }.send(result);
 }
 
 /// Adds the package to the driver store and binds it to the devnode.
@@ -140,7 +191,7 @@ pub(crate) fn install_driver(inf: &Path) -> io::Result<()> {
 
 /// The driver store package the devnode runs, such as `oem12.inf`.
 fn current_package() -> Option<String> {
-    let (_set, devices) = our_devices().ok()?;
+    let (_set, devices) = our_devices(&[HARDWARE_ID]).ok()?;
     let mut buf = [0u16; 64];
     let mut size = size_of_val(&buf) as u32;
     let mut kind: DEVPROPTYPE = 0;
