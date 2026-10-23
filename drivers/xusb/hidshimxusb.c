@@ -24,6 +24,8 @@ EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL PadIoControl;
 static const GUID XUSB_GUID =
     { 0xEC87F1E3, 0xC13B, 0x4100, { 0xB5, 0xF7, 0x8B, 0x84, 0xD5, 0x42, 0x60, 0xCB } };
 static const GUID CONTROL_GUID = HIDSHIM_CONTROL_GUID_INIT;
+static const GUID HID_GUID =
+    { 0x4D1E55B2, 0xF16F, 0x11CF, { 0x88, 0xCB, 0x00, 0x11, 0x11, 0x00, 0x00, 0x30 } };
 
 #define IOCTL_XUSB_GET_INFORMATION    0x80006000
 #define IOCTL_XUSB_GET_CAPABILITIES   0x8000E004
@@ -35,6 +37,9 @@ static const GUID CONTROL_GUID = HIDSHIM_CONTROL_GUID_INIT;
 #define IOCTL_XUSB_GET_INFORMATION_EX 0x8000E3FC
 #define IOCTL_XUSB_WAIT_FOR_INPUT     0x8000E3AC
 #define IOCTL_XUSB_POWER_INFO         0x80006380
+/* GameInput's service hides and shows controllers by input focus. */
+#define IOCTL_XUSB_HIDE               0x8000A390
+#define IOCTL_XUSB_SHOW               0x8000A394
 
 #define XUSB_VERSION 0x0103
 #define XUSB_STATE_SIZE 29
@@ -43,9 +48,9 @@ static const GUID CONTROL_GUID = HIDSHIM_CONTROL_GUID_INIT;
 
 typedef struct {
     /* Serializes ownership changes with the interface state that follows
-     * them, and guards XusbCreated. */
+     * them, and guards InterfacesCreated. */
     WDFWAITLOCK OwnerLock;
-    BOOLEAN XusbCreated;
+    BOOLEAN InterfacesCreated;
     /* Guards everything below. */
     WDFWAITLOCK Lock;
     WDFFILEOBJECT Owner;
@@ -114,18 +119,45 @@ NTSTATUS PadDeviceAdd(_In_ WDFDRIVER Driver, _Inout_ PWDFDEVICE_INIT DeviceInit)
     return WdfDeviceCreateDeviceInterface(device, &CONTROL_GUID, &reference);
 }
 
-/* The XUSB interface is created on the first claim rather than here: the
+/*
+ * The pad's interfaces are created on the first claim rather than here: the
  * framework enables interfaces at start, which would show the pad for a
- * moment without an owner. */
-static NTSTATUS EnableXusb(WDFDEVICE Device, PAD_CTX *ctx)
+ * moment without an owner.
+ *
+ * The HID-class interface carries no HID protocol. SDL rescans for XInput
+ * pads only when a HID interface arrives or leaves, so without it Steam and
+ * SDL games never see a pad that appears after they start. WGI ignores it
+ * for devices with the xinputhid filter string.
+ */
+#define NOTIFY_REFERENCE L"notify"
+
+static VOID SetNotifyState(WDFDEVICE Device, BOOLEAN enabled)
 {
-    if (!ctx->XusbCreated) {
+    UNICODE_STRING reference;
+    RtlInitUnicodeString(&reference, NOTIFY_REFERENCE);
+    WdfDeviceSetDeviceInterfaceState(Device, &HID_GUID, &reference, enabled);
+}
+
+static NTSTATUS ShowPad(WDFDEVICE Device, PAD_CTX *ctx)
+{
+    if (!ctx->InterfacesCreated) {
+        UNICODE_STRING reference;
         NTSTATUS status = WdfDeviceCreateDeviceInterface(Device, &XUSB_GUID, NULL);
         if (!NT_SUCCESS(status)) return status;
-        ctx->XusbCreated = TRUE;
+        RtlInitUnicodeString(&reference, NOTIFY_REFERENCE);
+        status = WdfDeviceCreateDeviceInterface(Device, &HID_GUID, &reference);
+        if (!NT_SUCCESS(status)) return status;
+        ctx->InterfacesCreated = TRUE;
     }
     WdfDeviceSetDeviceInterfaceState(Device, &XUSB_GUID, NULL, TRUE);
+    SetNotifyState(Device, TRUE);
     return STATUS_SUCCESS;
+}
+
+static VOID HidePad(WDFDEVICE Device)
+{
+    SetNotifyState(Device, FALSE);
+    WdfDeviceSetDeviceInterfaceState(Device, &XUSB_GUID, NULL, FALSE);
 }
 
 static BOOLEAN IsControlOpen(WDFFILEOBJECT FileObject)
@@ -224,7 +256,7 @@ VOID PadFileCreate(_In_ WDFDEVICE Device, _In_ WDFREQUEST Request, _In_ WDFFILEO
     }
     WdfWaitLockRelease(ctx->Lock);
     if (NT_SUCCESS(status)) {
-        status = EnableXusb(Device, ctx);
+        status = ShowPad(Device, ctx);
         if (!NT_SUCCESS(status)) {
             WdfWaitLockAcquire(ctx->Lock, NULL);
             ctx->Owner = NULL;
@@ -247,13 +279,18 @@ VOID PadFileCleanup(_In_ WDFFILEOBJECT FileObject)
     WdfWaitLockAcquire(ctx->OwnerLock, NULL);
     WdfWaitLockAcquire(ctx->Lock, NULL);
     if (ctx->Owner == FileObject) {
+        WDFREQUEST waiting;
         PublishLocked(ctx, &neutral);
         ctx->Owner = NULL;
         released = TRUE;
+        /* xusb22 fails parked waits this way when a controller goes away. */
+        while (NT_SUCCESS(WdfIoQueueRetrieveNextRequest(ctx->WaitQueue, &waiting))) {
+            WdfRequestComplete(waiting, STATUS_DEVICE_REMOVED);
+        }
     }
     WdfWaitLockRelease(ctx->Lock);
     if (released) {
-        WdfDeviceSetDeviceInterfaceState(WdfFileObjectGetDevice(FileObject), &XUSB_GUID, NULL, FALSE);
+        HidePad(WdfFileObjectGetDevice(FileObject));
     }
     WdfWaitLockRelease(ctx->OwnerLock);
 }
@@ -378,6 +415,26 @@ VOID PadIoControl(
     UNREFERENCED_PARAMETER(OutputBufferLength);
     UNREFERENCED_PARAMETER(InputBufferLength);
 
+    /* Without an owner the port answers like an empty xusb22 slot. WGI drops
+     * its port when capabilities fail this way. */
+    switch (IoControlCode) {
+    case IOCTL_XUSB_GET_CAPABILITIES:
+    case IOCTL_XUSB_GET_STATE:
+    case IOCTL_XUSB_GET_LED_STATE:
+    case IOCTL_XUSB_GET_BATTERY_INFO:
+    case IOCTL_XUSB_SET_STATE: {
+        BOOLEAN connected;
+        WdfWaitLockAcquire(ctx->Lock, NULL);
+        connected = ctx->Owner != NULL;
+        WdfWaitLockRelease(ctx->Lock);
+        if (!connected) {
+            WdfRequestComplete(Request, STATUS_DEVICE_NOT_CONNECTED);
+            return;
+        }
+        break;
+    }
+    }
+
     switch (IoControlCode) {
     case IOCTL_HIDSHIM_GET_VERSION: {
         HIDSHIM_VERSION version = { HIDSHIM_PROTOCOL_VERSION, 0 };
@@ -420,16 +477,10 @@ VOID PadIoControl(
 
     case IOCTL_XUSB_GET_STATE: {
         UCHAR state[XUSB_STATE_SIZE];
-        BOOLEAN connected;
         WdfWaitLockAcquire(ctx->Lock, NULL);
-        connected = ctx->Owner != NULL;
         BuildState(ctx, FALSE, state);
         WdfWaitLockRelease(ctx->Lock);
-        if (connected) {
-            CompleteWithData(Request, state, sizeof(state), sizeof(state));
-        } else {
-            WdfRequestComplete(Request, STATUS_DEVICE_NOT_CONNECTED);
-        }
+        CompleteWithData(Request, state, sizeof(state), sizeof(state));
         break;
     }
 
@@ -439,6 +490,8 @@ VOID PadIoControl(
 
     case IOCTL_XUSB_SET_STATE:
     case IOCTL_XUSB_POWER_INFO:
+    case IOCTL_XUSB_HIDE:
+    case IOCTL_XUSB_SHOW:
         WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, 0);
         break;
 
