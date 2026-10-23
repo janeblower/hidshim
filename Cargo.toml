@@ -1,0 +1,11 @@
+[workspace]
+members = ["crates/sdk", "crates/cli"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+hidshim = { path = "crates/sdk" }
+windows-sys = "0.61.2"
