@@ -4,6 +4,8 @@ use std::{env, io, thread};
 use windows::Gaming::Input::Gamepad as WgiGamepad;
 use windows_sys::Win32::UI::Input::XboxController::{XINPUT_STATE, XInputGetState};
 
+mod window;
+
 const USAGE: &str = "usage: hidshim <command>
 
   install          install or update the driver (administrator)
@@ -67,10 +69,19 @@ fn connected_slots() -> Vec<u32> {
 }
 
 fn watch(duration: Duration) -> io::Result<()> {
+    let window = window::Window::open();
     let start = Instant::now();
     let mut last = String::new();
     while start.elapsed() < duration {
         let mut line = String::new();
+        if let Some(window) = &window {
+            window.pump();
+            line += if window.focused() {
+                "focused "
+            } else {
+                "unfocused "
+            };
+        }
         for slot in connected_slots() {
             let pad = xinput(slot).unwrap().Gamepad;
             line += &format!(
