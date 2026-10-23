@@ -6,6 +6,7 @@
 //! dropped.
 #![cfg(windows)]
 
+mod device;
 mod gamepad;
 mod install;
 mod pnp;

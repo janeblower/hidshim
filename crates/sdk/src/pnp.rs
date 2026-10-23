@@ -159,18 +159,34 @@ fn current_package() -> Option<String> {
     Some(first_string(&buf))
 }
 
-/// Removes our driver store packages except the one the devnode runs.
-pub(crate) fn remove_packages(all: bool) -> io::Result<()> {
-    let keep = if all { None } else { current_package() };
+/// The driver store directory of the package the devnode runs.
+pub(crate) fn current_package_dir() -> Option<PathBuf> {
+    let name = wide(current_package()?);
+    let mut buf = [0u16; 512];
+    // SAFETY: the buffer size is passed in characters.
+    let ok = unsafe {
+        SetupGetInfDriverStoreLocationW(
+            name.as_ptr(),
+            null(),
+            null(),
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+            null_mut(),
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let inf = PathBuf::from(OsString::from_wide(
+        &buf[..buf.iter().position(|&c| c == 0)?],
+    ));
+    inf.parent().map(Path::to_path_buf)
+}
+
+/// Removes all our driver store packages.
+pub(crate) fn remove_packages() -> io::Result<()> {
     for package in our_packages()? {
-        let name = package.file_name().unwrap();
-        if keep
-            .as_deref()
-            .is_some_and(|keep| name.eq_ignore_ascii_case(keep))
-        {
-            continue;
-        }
-        let name = wide(name);
+        let name = wide(package.file_name().unwrap());
         // SAFETY: name is NUL-terminated.
         check(unsafe { SetupUninstallOEMInfW(name.as_ptr(), SUOI_FORCEDELETE, null()) })?;
     }

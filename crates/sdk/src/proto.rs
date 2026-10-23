@@ -16,6 +16,7 @@ const fn ctl_code(function: u32, access: u32) -> u32 {
 
 pub(crate) const IOCTL_GET_VERSION: u32 = ctl_code(0x800, FILE_ANY_ACCESS);
 pub(crate) const IOCTL_SET_REPORT: u32 = ctl_code(0x801, FILE_WRITE_ACCESS);
+pub(crate) const IOCTL_REMOVE: u32 = ctl_code(0x802, FILE_WRITE_ACCESS);
 
 #[repr(C)]
 #[derive(Default)]

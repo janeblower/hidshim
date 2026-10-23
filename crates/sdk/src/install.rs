@@ -1,3 +1,5 @@
+use crate::device::{self, Device};
+use crate::proto::IOCTL_REMOVE;
 use crate::win::{check, wide};
 use crate::{pnp, sign};
 use std::collections::hash_map::RandomState;
@@ -22,6 +24,14 @@ static INF_BYTES: &[u8] = include_bytes!(concat!(env!("HIDSHIM_DRIVER_DIR"), "/h
 /// Installs or updates the driver and creates the pad's devnode. Needs
 /// administrator rights.
 pub fn install() -> io::Result<()> {
+    if is_current() {
+        return pnp::ensure_device();
+    }
+    // The driver store keys packages by INF content and keeps an existing
+    // copy, whose catalog would then be signed by a certificate no longer
+    // trusted. Removing everything first makes the new package the only one.
+    uninstall()?;
+
     let stage = Stage::create()?;
     stage.put(DRIVER, DRIVER_BYTES)?;
     stage.put(INF, INF_BYTES)?;
@@ -39,15 +49,29 @@ pub fn install() -> io::Result<()> {
     sign::trust(&certificate)?;
 
     pnp::ensure_device()?;
-    pnp::install_driver(&stage.dir.join(INF))?;
-    pnp::remove_packages(false)
+    pnp::install_driver(&stage.dir.join(INF))
+}
+
+/// Whether the devnode runs exactly our files from a package that still
+/// verifies.
+fn is_current() -> bool {
+    let Some(dir) = pnp::current_package_dir() else {
+        return false;
+    };
+    let same = |name: &str, bytes: &[u8]| std::fs::read(dir.join(name)).is_ok_and(|b| b == bytes);
+    same(DRIVER, DRIVER_BYTES) && same(INF, INF_BYTES) && sign::verify(&dir.join(pnp::CATALOG)) == 0
 }
 
 /// Removes the devnode, the driver packages and the signing certificate.
 /// Needs administrator rights.
 pub fn uninstall() -> io::Result<()> {
+    // Without this, WGI clients holding the device veto its removal and
+    // Windows asks for a reboot.
+    for device in Device::open_all(device::ADMIN)? {
+        device?.ioctl(IOCTL_REMOVE, &[], &mut [])?;
+    }
     pnp::remove_devices()?;
-    pnp::remove_packages(true)?;
+    pnp::remove_packages()?;
     sign::untrust()
 }
 

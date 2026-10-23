@@ -412,33 +412,35 @@ fn subject_name(cert: *const CERT_CONTEXT) -> String {
     String::from_utf16_lossy(&buf[..len.saturating_sub(1) as usize])
 }
 
+/// `WinVerifyTrust` result for a signed file: 0 when its signature is intact
+/// and chains to a trusted root.
+pub(crate) fn verify(file: &Path) -> i32 {
+    use windows_sys::Win32::Security::WinTrust::*;
+    let path = wide(file);
+    let mut file_info = WINTRUST_FILE_INFO {
+        cbStruct: size_of::<WINTRUST_FILE_INFO>() as u32,
+        pcwszFilePath: path.as_ptr(),
+        ..Default::default()
+    };
+    let mut data = WINTRUST_DATA {
+        cbStruct: size_of::<WINTRUST_DATA>() as u32,
+        dwUIChoice: WTD_UI_NONE,
+        fdwRevocationChecks: WTD_REVOKE_NONE,
+        dwUnionChoice: WTD_CHOICE_FILE,
+        Anonymous: WINTRUST_DATA_0 {
+            pFile: &mut file_info,
+        },
+        dwStateAction: WTD_STATEACTION_IGNORE,
+        ..Default::default()
+    };
+    let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    // SAFETY: all pointers refer to locals that outlive the call.
+    unsafe { WinVerifyTrust(null_mut(), &mut action, (&raw mut data).cast()) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows_sys::Win32::Security::WinTrust::*;
-
-    fn verify(file: &Path) -> i32 {
-        let path = wide(file);
-        let mut file_info = WINTRUST_FILE_INFO {
-            cbStruct: size_of::<WINTRUST_FILE_INFO>() as u32,
-            pcwszFilePath: path.as_ptr(),
-            ..Default::default()
-        };
-        let mut data = WINTRUST_DATA {
-            cbStruct: size_of::<WINTRUST_DATA>() as u32,
-            dwUIChoice: WTD_UI_NONE,
-            fdwRevocationChecks: WTD_REVOKE_NONE,
-            dwUnionChoice: WTD_CHOICE_FILE,
-            Anonymous: WINTRUST_DATA_0 {
-                pFile: &mut file_info,
-            },
-            dwStateAction: WTD_STATEACTION_IGNORE,
-            ..Default::default()
-        };
-        let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
-        // SAFETY: all pointers refer to locals that outlive the call.
-        unsafe { WinVerifyTrust(null_mut(), &mut action, (&raw mut data).cast()) }
-    }
 
     #[test]
     fn signed_catalog_is_intact_but_untrusted() {
