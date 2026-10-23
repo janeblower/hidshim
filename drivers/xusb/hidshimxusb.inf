@@ -1,0 +1,72 @@
+;
+; hidshim XUSB pad
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+; Not XnaComposite: that class publishes an interface WGI would count as a
+; second controller.
+Class       = System
+ClassGuid   = {4D36E97D-E325-11CE-BFC1-08002BE10318}
+Provider    = %ProviderName%
+CatalogFile = hidshimxusb.cat
+DriverVer   = 10/23/2026,0.1.0.0
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+hidshimxusb.dll = 1
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTamd64
+
+[Standard.NTamd64]
+%DeviceDesc% = Pad_Install, ROOT\HIDSHIM_XUSB
+
+[Pad_Install.NT]
+CopyFiles = Pad_CopyFiles
+
+[Pad_CopyFiles]
+hidshimxusb.dll
+
+[Pad_Install.NT.HW]
+AddReg = Pad_HW_AddReg
+
+[Pad_HW_AddReg]
+HKR,,"XusbMode",0x00010001,1
+; xinputhid never attaches to a System-class device, but WGI checks for
+; this string to route the device through its XUSB path.
+HKR,,"UpperFilters",0x00010008,"xinputhid"
+HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;WD)"
+
+[Pad_Install.NT.Services]
+AddService = WUDFRd,0x000001fa,WUDFRD_Service
+
+[WUDFRD_Service]
+DisplayName   = %WudfRdDesc%
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %10%\System32\Drivers\WUDFRd.sys
+
+[Pad_Install.NT.Wdf]
+UmdfService              = hidshimxusb, Pad_UmdfService
+UmdfServiceOrder         = hidshimxusb
+UmdfFileObjectPolicy     = AllowNullAndUnknownFileObjects
+UmdfKernelModeClientPolicy = AllowKernelModeClients
+
+[Pad_UmdfService]
+UmdfLibraryVersion = 2.15.0
+ServiceBinary      = %13%\hidshimxusb.dll
+
+[Strings]
+ProviderName     = "hidshim"
+ManufacturerName = "hidshim"
+DeviceDesc       = "hidshim XInput pad"
+DiskName         = "hidshim"
+WudfRdDesc       = "Windows Driver Foundation - User-mode Driver Framework Reflector"
