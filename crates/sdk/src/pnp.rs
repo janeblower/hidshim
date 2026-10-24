@@ -41,10 +41,14 @@ fn devinfo() -> SP_DEVINFO_DATA {
     }
 }
 
-/// Devnodes carrying one of our hardware IDs, present or not.
-fn our_devices(ids: &[&str]) -> io::Result<(DeviceSet, Vec<SP_DEVINFO_DATA>)> {
+/// Devnodes carrying one of our hardware IDs; with `DIGCF_PRESENT` only
+/// those present now.
+fn our_devices(
+    ids: &[&str],
+    flags: SETUP_DI_GET_CLASS_DEVS_FLAGS,
+) -> io::Result<(DeviceSet, Vec<SP_DEVINFO_DATA>)> {
     // SAFETY: plain query; the handle is owned by DeviceSet.
-    let set = unsafe { SetupDiGetClassDevsW(&GUID_DEVCLASS_SYSTEM, null(), null_mut(), 0) };
+    let set = unsafe { SetupDiGetClassDevsW(&GUID_DEVCLASS_SYSTEM, null(), null_mut(), flags) };
     if set == INVALID_HANDLE_VALUE as HDEVINFO {
         return Err(io::Error::last_os_error());
     }
@@ -86,9 +90,10 @@ fn first_string(buf: &[u16]) -> String {
     String::from_utf16_lossy(&buf[..end])
 }
 
-/// Creates the pad's software devnode, which outlives this process.
+/// Creates the pad's software devnode, which outlives this process but not a
+/// reboot: after one it stays registered yet absent until created again.
 pub(crate) fn ensure_device() -> io::Result<()> {
-    if !our_devices(&[HARDWARE_ID])?.1.is_empty() {
+    if !our_devices(&[HARDWARE_ID], DIGCF_PRESENT)?.1.is_empty() {
         return Ok(());
     }
     let device = SoftwareDevice::create()?;
@@ -99,12 +104,12 @@ pub(crate) fn ensure_device() -> io::Result<()> {
 pub(crate) fn remove_devices() -> io::Result<()> {
     // Reattaching hands the persistent devnode back to a handle, whose
     // close then removes it for good.
-    if !our_devices(&[HARDWARE_ID])?.1.is_empty() {
+    if !our_devices(&[HARDWARE_ID], 0)?.1.is_empty() {
         let device = SoftwareDevice::create()?;
         // SAFETY: the handle came from SwDeviceCreate.
         hr(unsafe { SwDeviceSetLifetime(device.0, SWDeviceLifetimeHandle) })?;
     }
-    let (set, devices) = our_devices(&[HARDWARE_ID, LEGACY_HARDWARE_ID])?;
+    let (set, devices) = our_devices(&[HARDWARE_ID, LEGACY_HARDWARE_ID], 0)?;
     for data in devices {
         // SAFETY: data belongs to set.
         check(unsafe { DiUninstallDevice(null_mut(), set.0, &data, 0, null_mut()) })?;
@@ -191,7 +196,7 @@ pub(crate) fn install_driver(inf: &Path) -> io::Result<()> {
 
 /// The driver store package the devnode runs, such as `oem12.inf`.
 fn current_package() -> Option<String> {
-    let (_set, devices) = our_devices(&[HARDWARE_ID]).ok()?;
+    let (_set, devices) = our_devices(&[HARDWARE_ID], 0).ok()?;
     let mut buf = [0u16; 64];
     let mut size = size_of_val(&buf) as u32;
     let mut kind: DEVPROPTYPE = 0;
