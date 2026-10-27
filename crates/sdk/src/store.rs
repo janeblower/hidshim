@@ -132,10 +132,14 @@ impl SoftwareDevice {
             ..Default::default()
         };
         let (sender, receiver) = channel::<HRESULT>();
+        // The callback owns its sender: it is still inside send() when the
+        // receive below returns, so one borrowed from this frame would be
+        // dropped under it.
+        let context = Box::into_raw(Box::new(sender));
         let mut handle = null_mut();
-        // SAFETY: info and its strings outlive the call; the sender outlives
-        // the callback, which runs before the receive below returns or never.
-        hr(unsafe {
+        // SAFETY: info and its strings outlive the call, which reads them
+        // before the callback reports.
+        let created = hr(unsafe {
             SwDeviceCreate(
                 ENUMERATOR,
                 w!("HTREE\\ROOT\\0"),
@@ -143,10 +147,15 @@ impl SoftwareDevice {
                 0,
                 null(),
                 Some(on_created),
-                (&raw const sender).cast(),
+                context.cast_const().cast(),
                 &mut handle,
             )
-        })?;
+        });
+        if let Err(e) = created {
+            // SAFETY: the callback never runs when creation fails outright.
+            drop(unsafe { Box::from_raw(context) });
+            return Err(e);
+        }
         let device = Self(handle);
         match receiver.recv_timeout(Duration::from_secs(30)) {
             Ok(code) => hr(code).map(|()| device),
@@ -171,8 +180,10 @@ unsafe extern "system" fn on_created(
     context: *const c_void,
     _instance: PCWSTR,
 ) {
-    // SAFETY: context is the Sender that SoftwareDevice::create keeps alive.
-    let _ = unsafe { &*context.cast::<Sender<HRESULT>>() }.send(result);
+    // SAFETY: context is the boxed Sender SoftwareDevice::create hands over;
+    // the callback runs once.
+    let sender = unsafe { Box::from_raw(context.cast_mut().cast::<Sender<HRESULT>>()) };
+    let _ = sender.send(result);
 }
 
 /// Adds the package to the driver store and binds it to the devnode.
