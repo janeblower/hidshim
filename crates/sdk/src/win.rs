@@ -1,13 +1,15 @@
-use std::ffi::OsStr;
 use std::io;
-use std::os::windows::ffi::OsStrExt;
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     CM_MapCrToWin32Err, CONFIGRET, CR_SUCCESS,
 };
 use windows_sys::Win32::Foundation::ERROR_GEN_FAILURE;
-use windows_sys::core::{BOOL, HRESULT};
+use windows_sys::core::BOOL;
+#[cfg(feature = "install")]
+use windows_sys::core::HRESULT;
 
-pub(crate) fn wide(s: impl AsRef<OsStr>) -> Vec<u16> {
+#[cfg(feature = "install")]
+pub(crate) fn wide(s: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
     s.as_ref().encode_wide().chain(Some(0)).collect()
 }
 
@@ -19,6 +21,7 @@ pub(crate) fn check(ok: BOOL) -> io::Result<()> {
     }
 }
 
+#[cfg(feature = "install")]
 pub(crate) fn hr(code: HRESULT) -> io::Result<()> {
     if code < 0 {
         Err(io::Error::from_raw_os_error(code))

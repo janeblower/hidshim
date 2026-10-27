@@ -10,7 +10,7 @@ name = "hidshim"
 path = "src/main.rs"
 
 [dependencies]
-hidshim.workspace = true
+hidshim = { workspace = true, features = ["install"] }
 windows = { version = "0.62.2", features = ["Gaming_Input", "Foundation_Collections"] }
 windows-sys = { workspace = true, features = [
     "Win32_UI_Input_XboxController",

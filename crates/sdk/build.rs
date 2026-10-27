@@ -1,6 +1,9 @@
 use std::path::Path;
 
 fn main() {
+    if std::env::var_os("CARGO_FEATURE_INSTALL").is_none() {
+        return;
+    }
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/drivers/xusb");
     for file in ["hidshimxusb.dll", "hidshimxusb.inf"] {
         let path = dir.join(file);
