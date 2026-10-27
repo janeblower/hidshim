@@ -1,0 +1,29 @@
+name: ci
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v6
+        with:
+          path: .wdk
+          key: wdk-${{ hashFiles('drivers/build.ps1') }}
+
+      - run: cargo fmt --all --check
+      - run: ./drivers/build.ps1
+        shell: pwsh
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # The client alone must build without the driver.
+      - run: cargo check -p hidshim --locked
+      - run: cargo test --workspace --locked
+      # Runners are elevated, so the driver is installed and driven for real.
+      - run: cargo test -p hidshim --features install --test driver --locked -- --ignored --test-threads=1
