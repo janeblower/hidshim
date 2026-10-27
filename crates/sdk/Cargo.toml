@@ -3,6 +3,7 @@ name = "hidshim"
 description = "Virtual XInput pad for Windows on a user-mode driver"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 windows-sys = { workspace = true, features = [
