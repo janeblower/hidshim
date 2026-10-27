@@ -1,9 +1,10 @@
 //! Virtual Xbox 360 pad for XInput and Windows.Gaming.Input, backed by a
 //! user-mode driver.
 //!
-//! [`Gamepad::open`] needs no elevation: the pad appears when it is opened and
-//! disappears when it is dropped. [`status`] tells whether the driver is
-//! installed and running. Installing takes the `install` feature, which builds
+//! [`Gamepad::open`] needs no elevation: it claims one of the installed pads,
+//! which appears when it is opened and disappears when it is dropped.
+//! [`status`] tells whether the driver is installed and running, and [`pads`]
+//! which pads are held and by whom. Installing takes the `install` feature, which builds
 //! the driver into the crate, and administrator rights.
 #![cfg(windows)]
 
@@ -19,7 +20,7 @@ mod sign;
 mod store;
 mod win;
 
-pub use gamepad::{Buttons, Gamepad, State};
+pub use gamepad::{Buttons, Gamepad, Pad, State, pads};
 #[cfg(feature = "install")]
-pub use install::{install, uninstall};
+pub use install::{install, restore, uninstall};
 pub use pnp::{Status, status};

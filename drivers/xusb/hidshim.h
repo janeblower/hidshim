@@ -13,7 +13,8 @@
 
 /* Distinguishes control opens from XInput opens of the same device. */
 #define HIDSHIM_CONTROL_REFERENCE L"ctl"
-/* Reaches the device without claiming the pad, for IOCTL_HIDSHIM_REMOVE. */
+/* Reaches the device without claiming the pad, for IOCTL_HIDSHIM_REMOVE and
+ * IOCTL_HIDSHIM_GET_PAD_INFO. */
 #define HIDSHIM_ADMIN_REFERENCE L"admin"
 
 #define IOCTL_HIDSHIM_GET_VERSION \
@@ -23,11 +24,22 @@
 /* Administrators only; the driver checks the caller's token. */
 #define IOCTL_HIDSHIM_REMOVE \
     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+#define IOCTL_HIDSHIM_GET_PAD_INFO \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+/* HIDSHIM_VERSION.Capabilities: the driver answers IOCTL_HIDSHIM_GET_PAD_INFO. */
+#define HIDSHIM_CAP_PAD_INFO 0x1
 
 typedef struct {
     ULONG Version;
     ULONG Capabilities;
 } HIDSHIM_VERSION;
+
+typedef struct {
+    ULONG Owned;
+    /* Process that claimed the pad, 0 when it is free. */
+    ULONG OwnerProcessId;
+} HIDSHIM_PAD_INFO;
 
 /* Same layout as XINPUT_GAMEPAD. */
 typedef struct {
@@ -41,4 +53,5 @@ typedef struct {
 } HIDSHIM_GAMEPAD_REPORT;
 
 C_ASSERT(sizeof(HIDSHIM_VERSION) == 8);
+C_ASSERT(sizeof(HIDSHIM_PAD_INFO) == 8);
 C_ASSERT(sizeof(HIDSHIM_GAMEPAD_REPORT) == 12);

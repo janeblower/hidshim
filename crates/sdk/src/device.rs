@@ -1,6 +1,6 @@
 //! Handles to the driver's control interfaces.
 
-use crate::proto::CONTROL_GUID;
+use crate::proto::{CONTROL_GUID, PadInfo, Version};
 use crate::win::{check, cr};
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -17,26 +17,29 @@ use windows_sys::Win32::System::IO::DeviceIoControl;
 
 /// Reference strings of the control interfaces, see drivers/xusb/hidshim.h.
 pub(crate) const CONTROL: &str = "ctl";
-#[cfg(feature = "install")]
 pub(crate) const ADMIN: &str = "admin";
 
 #[derive(Debug)]
 pub(crate) struct Device(OwnedHandle);
 
+/// A present control interface of one pad.
+pub(crate) struct Interface {
+    pub index: u8,
+    path: Vec<u16>,
+}
+
+impl Interface {
+    pub(crate) fn open(&self) -> io::Result<Device> {
+        Device::open(&self.path)
+    }
+}
+
+/// Replies the driver fills in whole: `repr(C)` structs of `u32` fields.
+pub(crate) trait Reply: Default {}
+impl Reply for Version {}
+impl Reply for PadInfo {}
+
 impl Device {
-    /// Opens every present control interface with this reference string.
-    pub(crate) fn open_all(reference: &str) -> io::Result<Vec<io::Result<Self>>> {
-        Ok(paths(reference)?
-            .iter()
-            .map(|path| Self::open(path))
-            .collect())
-    }
-
-    /// Whether a control interface with this reference string is present.
-    pub(crate) fn any(reference: &str) -> io::Result<bool> {
-        Ok(!paths(reference)?.is_empty())
-    }
-
     fn open(path: &[u16]) -> io::Result<Self> {
         // SAFETY: path is NUL-terminated; the result is checked.
         let raw = unsafe {
@@ -77,13 +80,58 @@ impl Device {
         }
         Ok(())
     }
+
+    pub(crate) fn query<T: Reply>(&self, code: u32) -> io::Result<T> {
+        let mut reply = T::default();
+        // SAFETY: Reply types are repr(C) plain data; any bytes are a valid value.
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut((&raw mut reply).cast::<u8>(), size_of::<T>())
+        };
+        self.ioctl(code, &[], bytes)?;
+        Ok(reply)
+    }
 }
 
-/// NUL-terminated paths of the present control interfaces ending in
-/// `\reference`.
-fn paths(reference: &str) -> io::Result<Vec<Vec<u16>>> {
-    let suffix: Vec<u16> = format!("\\{reference}").encode_utf16().collect();
-    let list = loop {
+/// Present control interfaces with this reference string, by pad index.
+pub(crate) fn interfaces(reference: &str) -> io::Result<Vec<Interface>> {
+    let mut found: Vec<Interface> = paths()?
+        .split(|&c| c == 0)
+        .filter_map(|path| {
+            let text = String::from_utf16_lossy(path);
+            if !has_reference(&text, reference) {
+                return None;
+            }
+            Some(Interface {
+                index: pad_index(&text)?,
+                path: path.iter().copied().chain(Some(0)).collect(),
+            })
+        })
+        .collect();
+    found.sort_by_key(|interface| interface.index);
+    Ok(found)
+}
+
+fn has_reference(path: &str, reference: &str) -> bool {
+    path.rsplit_once('\\')
+        .is_some_and(|(_, tail)| tail.eq_ignore_ascii_case(reference))
+}
+
+/// The pad index in an interface path such as
+/// `\\?\SWD#HIDSHIM#XUSB2#{...}\ctl`. The single pad of 0.1.0 had no number.
+fn pad_index(path: &str) -> Option<u8> {
+    const MARKER: &str = "#HIDSHIM#XUSB";
+    let start = path.to_ascii_uppercase().find(MARKER)? + MARKER.len();
+    let rest = &path[start..];
+    let digits = &rest[..rest.find('#')?];
+    if digits.is_empty() {
+        return Some(0);
+    }
+    digits.parse().ok()
+}
+
+/// The present interface list of the control GUID, NUL-separated.
+fn paths() -> io::Result<Vec<u16>> {
+    loop {
         let mut len = 0;
         // SAFETY: out-pointer to a local.
         cr(unsafe {
@@ -108,16 +156,32 @@ fn paths(reference: &str) -> io::Result<Vec<Vec<u16>>> {
         // The list can grow between the two calls.
         if status != CR_BUFFER_SMALL {
             cr(status)?;
-            break list;
+            return Ok(list);
         }
-    };
-    Ok(list
-        .split(|&c| c == 0)
-        .filter(|path| {
-            path.len() >= suffix.len()
-                && String::from_utf16_lossy(&path[path.len() - suffix.len()..])
-                    .eq_ignore_ascii_case(&String::from_utf16_lossy(&suffix))
-        })
-        .map(|path| path.iter().copied().chain(Some(0)).collect())
-        .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GUID: &str = "{8d0b6c2e-3f1a-4e5b-9c7d-2a6e1f4b8d30}";
+
+    #[test]
+    fn pad_index_comes_from_the_instance_id() {
+        let path = |instance: &str| format!(r"\\?\{instance}#{GUID}\ctl");
+        assert_eq!(pad_index(&path("SWD#HIDSHIM#XUSB0")), Some(0));
+        assert_eq!(pad_index(&path("swd#hidshim#xusb3")), Some(3));
+        assert_eq!(pad_index(&path("SWD#HIDSHIM#XUSB")), Some(0));
+        assert_eq!(pad_index(&path("SWD#HIDSHIM#XUSBx")), None);
+        assert_eq!(pad_index(&path("ROOT#SYSTEM#0001")), None);
+    }
+
+    #[test]
+    fn reference_must_be_the_whole_last_component() {
+        let path = |tail: &str| format!(r"\\?\SWD#HIDSHIM#XUSB0#{GUID}\{tail}");
+        assert!(has_reference(&path("CTL"), CONTROL));
+        assert!(!has_reference(&path("ctl"), ADMIN));
+        assert!(!has_reference(&path("xctl"), CONTROL));
+    }
 }

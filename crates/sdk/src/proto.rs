@@ -18,6 +18,9 @@ pub(crate) const IOCTL_GET_VERSION: u32 = ctl_code(0x800, FILE_ANY_ACCESS);
 pub(crate) const IOCTL_SET_REPORT: u32 = ctl_code(0x801, FILE_WRITE_ACCESS);
 #[cfg(feature = "install")]
 pub(crate) const IOCTL_REMOVE: u32 = ctl_code(0x802, FILE_WRITE_ACCESS);
+pub(crate) const IOCTL_GET_PAD_INFO: u32 = ctl_code(0x803, FILE_ANY_ACCESS);
+
+pub(crate) const CAP_PAD_INFO: u32 = 0x1;
 
 #[repr(C)]
 #[derive(Default)]
@@ -26,4 +29,26 @@ pub(crate) struct Version {
     pub capabilities: u32,
 }
 
+#[repr(C)]
+#[derive(Default)]
+pub(crate) struct PadInfo {
+    pub owned: u32,
+    pub owner_process_id: u32,
+}
+
 const _: () = assert!(size_of::<Version>() == 8);
+const _: () = assert!(size_of::<PadInfo>() == 8);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn control_codes_match_the_driver_header() {
+        assert_eq!(IOCTL_GET_VERSION, 0x0022_2000);
+        assert_eq!(IOCTL_SET_REPORT, 0x0022_a004);
+        #[cfg(feature = "install")]
+        assert_eq!(IOCTL_REMOVE, 0x0022_a008);
+        assert_eq!(IOCTL_GET_PAD_INFO, 0x0022_200c);
+    }
+}

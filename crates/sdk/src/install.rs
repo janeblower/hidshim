@@ -1,4 +1,5 @@
-use crate::device::{self, Device};
+use crate::device;
+use crate::pnp::{Status, status};
 use crate::proto::IOCTL_REMOVE;
 use crate::win::{check, wide};
 use crate::{sign, store};
@@ -21,11 +22,11 @@ static DRIVER_BYTES: &[u8] =
     include_bytes!(concat!(env!("HIDSHIM_DRIVER_DIR"), "/hidshimxusb.dll"));
 static INF_BYTES: &[u8] = include_bytes!(concat!(env!("HIDSHIM_DRIVER_DIR"), "/hidshimxusb.inf"));
 
-/// Installs or updates the driver and creates the pad's devnode. Needs
+/// Installs or updates the driver and creates the pads' devnodes. Needs
 /// administrator rights.
 pub fn install() -> io::Result<()> {
     if is_current() {
-        return store::ensure_device();
+        return store::ensure_devices();
     }
     // The driver store keys packages by INF content and keeps an existing
     // copy, whose catalog would then be signed by a certificate no longer
@@ -48,11 +49,20 @@ pub fn install() -> io::Result<()> {
     };
     sign::trust(&certificate)?;
 
-    store::ensure_device()?;
+    store::ensure_devices()?;
     store::install_driver(&stage.dir.join(INF))
 }
 
-/// Whether the devnode runs exactly our files from a package that still
+/// Brings the pads back after a reboot, and does nothing when the driver is
+/// not installed. Needs administrator rights.
+pub fn restore() -> io::Result<()> {
+    if status()? == Status::NotInstalled {
+        return Ok(());
+    }
+    store::ensure_devices()
+}
+
+/// Whether the devnodes run exactly our files from a package that still
 /// verifies.
 fn is_current() -> bool {
     let Some(dir) = store::current_package_dir() else {
@@ -64,15 +74,16 @@ fn is_current() -> bool {
         && sign::verify(&dir.join(store::CATALOG)) == 0
 }
 
-/// Removes the devnode, the driver packages and the signing certificate.
+/// Removes the devnodes, the driver packages and the signing certificate.
 /// Needs administrator rights.
 pub fn uninstall() -> io::Result<()> {
     // Without this, WGI clients holding the device veto its removal and
     // Windows asks for a reboot.
-    for device in Device::open_all(device::ADMIN)? {
-        device?.ioctl(IOCTL_REMOVE, &[], &mut [])?;
+    let attached = store::attach_devices()?;
+    for interface in device::interfaces(device::ADMIN)? {
+        interface.open()?.ioctl(IOCTL_REMOVE, &[], &mut [])?;
     }
-    store::remove_devices()?;
+    store::remove_devices(attached)?;
     store::remove_packages()?;
     sign::untrust()
 }

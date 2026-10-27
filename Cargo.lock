@@ -4,14 +4,14 @@ version = 4
 
 [[package]]
 name = "hidshim"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "windows-sys",
 ]
 
 [[package]]
 name = "hidshim-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hidshim",
  "windows",

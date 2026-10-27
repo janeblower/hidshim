@@ -1,6 +1,7 @@
 //! hidshim as an installed program: a copy in Program Files and an entry in
 //! the installed apps list that uninstalls it.
 
+use crate::autostart;
 use std::io;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::process::CommandExt;
@@ -18,7 +19,8 @@ use windows_sys::Win32::System::Registry::{
 };
 use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, DETACHED_PROCESS, GetCurrentProcess, GetExitCodeProcess, INFINITE,
-    OpenProcessToken, WaitForSingleObject,
+    OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    QueryFullProcessImageNameW, WaitForSingleObject,
 };
 use windows_sys::Win32::UI::Shell::{
     FOLDERID_ProgramFiles, FOLDERID_System, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
@@ -30,11 +32,11 @@ use windows_sys::core::GUID;
 const UNINSTALL_KEY: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\hidshim";
 const EXE: &str = "hidshim.exe";
 
-/// Copies this program to Program Files, lists it among installed apps and
-/// installs the driver.
-pub fn install() -> io::Result<()> {
-    let dir = known_folder(&FOLDERID_ProgramFiles)?.join("hidshim");
-    let exe = dir.join(EXE);
+/// Copies this program to Program Files, lists it among installed apps,
+/// installs the driver and registers or removes the boot task that brings the
+/// pads back after a reboot.
+pub fn install(on_boot: bool) -> io::Result<()> {
+    let (dir, exe) = installed()?;
     let current = std::env::current_exe()?;
     if !same_file(&current, &exe) {
         std::fs::create_dir_all(&dir)?;
@@ -46,20 +48,35 @@ pub fn install() -> io::Result<()> {
     // Listed before the driver goes in, so a failed install can still be
     // removed from the installed apps list.
     register(&dir, &exe)?;
-    hidshim::install()
+    hidshim::install()?;
+    autostart::set(on_boot, &exe)
+        .map_err(|e| io::Error::other(format!("the driver is installed, but the boot task: {e}")))
+}
+
+/// Registers or removes the boot task for the installed copy.
+pub fn set_autostart(on: bool) -> io::Result<()> {
+    let (_, exe) = installed()?;
+    if on && !exe.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "hidshim is not installed as a program; run hidshim install",
+        ));
+    }
+    autostart::set(on, &exe)
 }
 
 /// Removes the driver, the installed apps entry and the copy in Program Files.
 pub fn uninstall() -> io::Result<()> {
+    let (dir, exe) = installed()?;
+    // After the driver: a task left behind only finds nothing to restore.
     hidshim::uninstall()?;
+    autostart::set(false, &exe)?;
     let key = wide(UNINSTALL_KEY);
     // SAFETY: key is NUL-terminated.
     let status = unsafe { RegDeleteTreeW(HKEY_LOCAL_MACHINE, key.as_ptr()) };
     if status != ERROR_SUCCESS && status != ERROR_FILE_NOT_FOUND {
         return Err(io::Error::from_raw_os_error(status as i32));
     }
-    let dir = known_folder(&FOLDERID_ProgramFiles)?.join("hidshim");
-    let exe = dir.join(EXE);
     if same_file(&std::env::current_exe()?, &exe) {
         return remove_after_exit(&dir, &exe);
     }
@@ -106,6 +123,36 @@ pub fn relaunch_elevated() -> io::Result<Option<i32>> {
         return Err(io::Error::last_os_error());
     }
     Ok(Some(code as i32))
+}
+
+/// The executable name of a running process, when this user may see it.
+pub fn process_name(pid: u32) -> Option<String> {
+    // SAFETY: the handle is checked and closed below.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return None;
+    }
+    let mut buf = [0u16; 1024];
+    let mut len = buf.len() as u32;
+    // SAFETY: len holds the buffer size in characters.
+    let ok = unsafe {
+        let ok =
+            QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len);
+        CloseHandle(process);
+        ok
+    };
+    if ok == 0 {
+        return None;
+    }
+    let path = PathBuf::from(std::ffi::OsString::from_wide(&buf[..len as usize]));
+    Some(path.file_name()?.to_string_lossy().into_owned())
+}
+
+/// The Program Files directory and copy of hidshim.
+fn installed() -> io::Result<(PathBuf, PathBuf)> {
+    let dir = known_folder(&FOLDERID_ProgramFiles)?.join("hidshim");
+    let exe = dir.join(EXE);
+    Ok((dir, exe))
 }
 
 fn is_elevated() -> io::Result<bool> {
