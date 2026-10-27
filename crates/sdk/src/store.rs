@@ -8,7 +8,7 @@ use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::sync::mpsc::{Sender, channel};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::*;
 use windows_sys::Win32::Devices::Enumeration::Pnp::*;
 use windows_sys::Win32::Devices::Properties::{DEVPKEY_Device_DriverInfPath, DEVPROPTYPE};
@@ -16,34 +16,52 @@ use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 use windows_sys::core::{GUID, HRESULT, PCWSTR, w};
 
 const ENUMERATOR: PCWSTR = w!("HIDSHIM");
-const INSTANCE: PCWSTR = w!("XUSB");
+/// XInput serves four slots, physical pads included.
+pub(crate) const PADS: u8 = 4;
 /// Devnodes of builds that used a root-enumerated device.
 const LEGACY_HARDWARE_ID: &str = "ROOT\\HIDSHIM_XUSB";
-/// GameInput groups device interfaces by ContainerId; a root devnode only
-/// gets the shared sentinel, which folds the pad into unrelated devices.
-const CONTAINER_ID: GUID = GUID::from_u128(0x6a3e5f71_2c8d_4b9a_9e14_5d7c3b2a1f80);
+/// GameInput groups device interfaces by ContainerId: a root devnode only
+/// gets the shared sentinel, which folds the pad into unrelated devices, and
+/// pads sharing one would show as one controller. Pad n uses this plus n.
+const CONTAINER_ID: u128 = 0x6a3e5f71_2c8d_4b9a_9e14_5d7c3b2a1f80;
 const PROVIDER: &str = "hidshim";
 pub(crate) const CATALOG: &str = "hidshimxusb.cat";
 
-/// Creates the pad's software devnode, which outlives this process but not a
-/// reboot: after one it stays registered yet absent until created again.
-pub(crate) fn ensure_device() -> io::Result<()> {
-    if !our_devices(&[HARDWARE_ID], DIGCF_PRESENT)?.1.is_empty() {
-        return Ok(());
+/// Creates the pads' software devnodes, which outlive this process but not a
+/// reboot: after one they stay registered yet absent until created again.
+pub(crate) fn ensure_devices() -> io::Result<()> {
+    let present = instances(DIGCF_PRESENT)?;
+    for index in 0..PADS {
+        let instance = instance(index);
+        if present.iter().any(|p| p.eq_ignore_ascii_case(&instance)) {
+            continue;
+        }
+        let device = SoftwareDevice::create(&instance)?;
+        // SAFETY: the handle came from SwDeviceCreate.
+        hr(unsafe { SwDeviceSetLifetime(device.0, SWDeviceLifetimeParentPresent) })?;
     }
-    let device = SoftwareDevice::create()?;
-    // SAFETY: the handle came from SwDeviceCreate.
-    hr(unsafe { SwDeviceSetLifetime(device.0, SWDeviceLifetimeParentPresent) })
+    Ok(())
 }
 
-pub(crate) fn remove_devices() -> io::Result<()> {
-    // Reattaching hands the persistent devnode back to a handle, whose
-    // close then removes it for good.
-    if !our_devices(&[HARDWARE_ID], 0)?.1.is_empty() {
-        let device = SoftwareDevice::create()?;
-        // SAFETY: the handle came from SwDeviceCreate.
-        hr(unsafe { SwDeviceSetLifetime(device.0, SWDeviceLifetimeHandle) })?;
-    }
+/// Hands every persistent devnode back to a handle, whose close in
+/// [`remove_devices`] removes it for good. Attaching must come before the
+/// driver fails the devices: once one of them is removed, attaching another
+/// failed one never completes.
+pub(crate) fn attach_devices() -> io::Result<Vec<SoftwareDevice>> {
+    instances(0)?
+        .iter()
+        .map(|instance| {
+            let device = SoftwareDevice::create(instance)?;
+            // SAFETY: the handle came from SwDeviceCreate.
+            hr(unsafe { SwDeviceSetLifetime(device.0, SWDeviceLifetimeHandle) })?;
+            Ok(device)
+        })
+        .collect()
+}
+
+pub(crate) fn remove_devices(attached: Vec<SoftwareDevice>) -> io::Result<()> {
+    drop(attached);
+    wait_gone()?;
     let (set, devices) = our_devices(&[HARDWARE_ID, LEGACY_HARDWARE_ID], 0)?;
     for data in devices {
         // SAFETY: data belongs to set.
@@ -52,17 +70,62 @@ pub(crate) fn remove_devices() -> io::Result<()> {
     Ok(())
 }
 
-struct SoftwareDevice(HSWDEVICE);
+fn instance(index: u8) -> String {
+    format!("XUSB{index}")
+}
+
+/// Instance names, such as `XUSB0`, of our software devnodes.
+fn instances(flags: SETUP_DI_GET_CLASS_DEVS_FLAGS) -> io::Result<Vec<String>> {
+    let (_set, devices) = our_devices(&[HARDWARE_ID], flags)?;
+    devices
+        .iter()
+        .map(|data| {
+            let mut buf = [0u16; MAX_DEVICE_ID_LEN as usize + 1];
+            // SAFETY: the buffer length is passed in characters.
+            cr(unsafe { CM_Get_Device_IDW(data.DevInst, buf.as_mut_ptr(), buf.len() as u32, 0) })?;
+            let id = first_string(&buf);
+            Ok(id.rsplit('\\').next().unwrap_or_default().to_string())
+        })
+        .collect()
+}
+
+/// Uninstalling a devnode PnP is still removing fails.
+fn wait_gone() -> io::Result<()> {
+    let start = Instant::now();
+    while !instances(DIGCF_PRESENT)?.is_empty() {
+        if start.elapsed() > Duration::from_secs(30) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "removing the pad devices timed out",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
+}
+
+/// The single pad of 0.1.0, instance `XUSB`, keeps the base ContainerId.
+fn container_id(instance: &str) -> GUID {
+    let index = instance
+        .get(4..)
+        .and_then(|n| n.parse::<u8>().ok())
+        .unwrap_or(0);
+    GUID::from_u128(CONTAINER_ID + u128::from(index))
+}
+
+pub(crate) struct SoftwareDevice(HSWDEVICE);
 
 impl SoftwareDevice {
-    fn create() -> io::Result<Self> {
+    fn create(instance: &str) -> io::Result<Self> {
         let mut ids = wide(HARDWARE_ID);
         ids.push(0);
+        let name = wide(instance);
+        let container = container_id(instance);
         let info = SW_DEVICE_CREATE_INFO {
             cbSize: size_of::<SW_DEVICE_CREATE_INFO>() as u32,
-            pszInstanceId: INSTANCE,
+            pszInstanceId: name.as_ptr(),
             pszzHardwareIds: ids.as_ptr(),
-            pContainerId: &CONTAINER_ID,
+            pContainerId: &container,
             CapabilityFlags: (SWDeviceCapabilitiesSilentInstall
                 | SWDeviceCapabilitiesDriverRequired) as u32,
             pszDeviceDescription: w!("hidshim XInput pad"),
@@ -236,4 +299,24 @@ fn is_ours(inf: &Path) -> bool {
     // SAFETY: handle came from SetupOpenInfFileW.
     unsafe { SetupCloseInfFile(handle) };
     ours
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_pad_gets_its_own_container() {
+        let value = |g: GUID| {
+            (u128::from(g.data1) << 96)
+                | (u128::from(g.data2) << 80)
+                | (u128::from(g.data3) << 64)
+                | u128::from(u64::from_be_bytes(g.data4))
+        };
+        for index in 0..PADS {
+            let id = value(container_id(&instance(index)));
+            assert_eq!(id, CONTAINER_ID + u128::from(index));
+        }
+        assert_eq!(value(container_id("XUSB")), CONTAINER_ID);
+    }
 }

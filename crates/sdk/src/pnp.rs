@@ -1,6 +1,6 @@
 //! The pad's devnode.
 
-use crate::device::{self, Device};
+use crate::device;
 use std::io;
 use std::ptr::{null, null_mut};
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::*;
@@ -78,17 +78,18 @@ pub(crate) fn first_string(buf: &[u16]) -> String {
 pub enum Status {
     /// The driver is not installed.
     NotInstalled,
-    /// The driver is installed but the pad's device is not running, as after
-    /// a reboot. Installing again brings it back.
+    /// The driver is installed but the pads' devices are not running, as
+    /// after a reboot. Installing again brings them back.
     NotPresent,
-    /// [`Gamepad::open`](crate::Gamepad::open) finds the pad.
+    /// The pads are running; [`Gamepad::open`](crate::Gamepad::open) claims
+    /// one unless all are in use.
     Ready,
 }
 
-/// Reports whether the driver is installed and its device is running. Needs
-/// no elevation.
+/// Reports whether the driver is installed and its devices are running.
+/// Needs no elevation.
 pub fn status() -> io::Result<Status> {
-    if Device::any(device::CONTROL)? {
+    if !device::interfaces(device::CONTROL)?.is_empty() {
         return Ok(Status::Ready);
     }
     Ok(if our_devices(&[HARDWARE_ID], 0)?.1.is_empty() {
