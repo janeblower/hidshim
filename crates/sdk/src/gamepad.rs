@@ -1,7 +1,11 @@
 use crate::device::{self, Device};
+use crate::pnp::{Status, status};
 use crate::proto::{IOCTL_GET_VERSION, IOCTL_SET_REPORT, PROTOCOL_VERSION, Version};
 use std::io;
 use std::ops::{BitOr, BitOrAssign};
+use windows_sys::Win32::Foundation::{
+    ERROR_BAD_COMMAND, ERROR_BUSY, ERROR_DEVICE_REMOVED, ERROR_NO_SUCH_DEVICE,
+};
 
 /// Pad buttons, the `wButtons` bits of `XINPUT_GAMEPAD`.
 #[repr(transparent)]
@@ -67,17 +71,20 @@ pub struct Gamepad {
 }
 
 impl Gamepad {
-    /// Claims the pad. Fails with [`io::ErrorKind::NotFound`] when the driver
-    /// is not installed and with `ERROR_BUSY` when another process owns it.
+    /// Claims the pad. Fails with [`io::ErrorKind::NotFound`] when the pad is
+    /// not there, see [`status`](crate::status) for why, and with
+    /// [`io::ErrorKind::ResourceBusy`] when another process owns it.
     pub fn open() -> io::Result<Self> {
         let device = Device::open_all(device::CONTROL)?
             .into_iter()
             .next()
-            .unwrap_or_else(|| {
-                Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "hidshim driver is not installed",
-                ))
+            .unwrap_or_else(|| Err(not_found()))
+            .map_err(|e| match e.raw_os_error() {
+                Some(code) if code == ERROR_BUSY as i32 => io::Error::new(
+                    io::ErrorKind::ResourceBusy,
+                    "the hidshim pad is in use by another process",
+                ),
+                _ => e,
             })?;
         let mut version = Version::default();
         // SAFETY: Version is repr(C) plain data; any bytes are a valid value.
@@ -94,12 +101,30 @@ impl Gamepad {
         Ok(Self { device })
     }
 
-    /// Sends the state XInput reports from now on.
+    /// Sends the state XInput reports from now on. Fails with
+    /// [`io::ErrorKind::NotConnected`] once the pad has been removed, as by
+    /// uninstalling; the pad is then gone for good.
     pub fn submit(&mut self, state: &State) -> io::Result<()> {
         // SAFETY: State is repr(C) plain data without padding.
         let bytes = unsafe {
             std::slice::from_raw_parts((state as *const State).cast::<u8>(), size_of::<State>())
         };
-        self.device.ioctl(IOCTL_SET_REPORT, bytes, &mut [])
+        self.device
+            .ioctl(IOCTL_SET_REPORT, bytes, &mut [])
+            .map_err(|e| match e.raw_os_error().map(|code| code as u32) {
+                // A failed or removed device answers with ERROR_BAD_COMMAND.
+                Some(ERROR_BAD_COMMAND | ERROR_DEVICE_REMOVED | ERROR_NO_SUCH_DEVICE) => {
+                    io::Error::new(io::ErrorKind::NotConnected, "the hidshim pad was removed")
+                }
+                _ => e,
+            })
     }
+}
+
+fn not_found() -> io::Error {
+    let message = match status() {
+        Ok(Status::NotInstalled) => "hidshim is not installed",
+        _ => "the hidshim pad is not running; installing hidshim again restores it",
+    };
+    io::Error::new(io::ErrorKind::NotFound, message)
 }

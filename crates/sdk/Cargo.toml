@@ -5,6 +5,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# install() and uninstall(), with the driver built into the crate.
+install = []
+
 [dependencies]
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",

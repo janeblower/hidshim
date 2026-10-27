@@ -1,15 +1,19 @@
-use hidshim::{Buttons, Gamepad, State};
+use hidshim::{Buttons, Gamepad, State, Status};
 use std::time::{Duration, Instant};
 use std::{env, io, thread};
 use windows::Gaming::Input::Gamepad as WgiGamepad;
 use windows_sys::Win32::UI::Input::XboxController::{XINPUT_STATE, XInputGetState};
 
+mod setup;
 mod window;
 
 const USAGE: &str = "usage: hidshim <command>
 
-  install          install or update the driver (administrator)
-  uninstall        remove the driver, devnode and certificate (administrator)
+  install          install or update hidshim and its driver, or bring the
+                   pad back after a reboot (asks for administrator rights)
+  uninstall        remove hidshim, its driver and certificate (asks for
+                   administrator rights)
+  status           whether the driver is installed and the pad is running
   pad [seconds]    hold the pad and play a test pattern (default 30)
   watch [seconds]  print what XInput and Windows.Gaming.Input see (default 30)
   bench [count]    latency from submit to XInputGetState (default 1000)";
@@ -18,8 +22,9 @@ fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let number = |default: u64| args.get(1).and_then(|s| s.parse().ok()).unwrap_or(default);
     let result = match args.first().map(String::as_str) {
-        Some("install") => hidshim::install(),
-        Some("uninstall") => hidshim::uninstall(),
+        Some("install") => elevated(setup::install),
+        Some("uninstall") => elevated(setup::uninstall),
+        Some("status") => status(),
         Some("pad") => pad(Duration::from_secs(number(30))),
         Some("watch") => watch(Duration::from_secs(number(30))),
         Some("bench") => bench(number(1000) as usize),
@@ -32,6 +37,28 @@ fn main() {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
+}
+
+fn elevated(run: fn() -> io::Result<()>) -> io::Result<()> {
+    match setup::relaunch_elevated()? {
+        None => run(),
+        Some(0) => Ok(()),
+        Some(code) => Err(io::Error::other(format!(
+            "the elevated hidshim failed with exit code {code}"
+        ))),
+    }
+}
+
+fn status() -> io::Result<()> {
+    println!(
+        "{}",
+        match hidshim::status()? {
+            Status::NotInstalled => "not installed",
+            Status::NotPresent => "installed, pad not running (run install to bring it back)",
+            Status::Ready => "ready",
+        }
+    );
+    Ok(())
 }
 
 fn pad(duration: Duration) -> io::Result<()> {

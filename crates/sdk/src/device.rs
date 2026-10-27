@@ -17,6 +17,7 @@ use windows_sys::Win32::System::IO::DeviceIoControl;
 
 /// Reference strings of the control interfaces, see drivers/xusb/hidshim.h.
 pub(crate) const CONTROL: &str = "ctl";
+#[cfg(feature = "install")]
 pub(crate) const ADMIN: &str = "admin";
 
 #[derive(Debug)]
@@ -29,6 +30,11 @@ impl Device {
             .iter()
             .map(|path| Self::open(path))
             .collect())
+    }
+
+    /// Whether a control interface with this reference string is present.
+    pub(crate) fn any(reference: &str) -> io::Result<bool> {
+        Ok(!paths(reference)?.is_empty())
     }
 
     fn open(path: &[u16]) -> io::Result<Self> {

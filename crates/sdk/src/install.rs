@@ -1,7 +1,7 @@
 use crate::device::{self, Device};
 use crate::proto::IOCTL_REMOVE;
 use crate::win::{check, wide};
-use crate::{pnp, sign};
+use crate::{sign, store};
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
 use std::io;
@@ -25,7 +25,7 @@ static INF_BYTES: &[u8] = include_bytes!(concat!(env!("HIDSHIM_DRIVER_DIR"), "/h
 /// administrator rights.
 pub fn install() -> io::Result<()> {
     if is_current() {
-        return pnp::ensure_device();
+        return store::ensure_device();
     }
     // The driver store keys packages by INF content and keeps an existing
     // copy, whose catalog would then be signed by a certificate no longer
@@ -42,24 +42,26 @@ pub fn install() -> io::Result<()> {
         // checked right before the catalog is built from them.
         stage.verify(DRIVER, DRIVER_BYTES)?;
         stage.verify(INF, INF_BYTES)?;
-        let catalog = sign::make_catalog(&stage.dir, pnp::CATALOG, &[DRIVER, INF])?;
+        let catalog = sign::make_catalog(&stage.dir, store::CATALOG, &[DRIVER, INF])?;
         signer.sign(&catalog)?;
         signer.certificate()
     };
     sign::trust(&certificate)?;
 
-    pnp::ensure_device()?;
-    pnp::install_driver(&stage.dir.join(INF))
+    store::ensure_device()?;
+    store::install_driver(&stage.dir.join(INF))
 }
 
 /// Whether the devnode runs exactly our files from a package that still
 /// verifies.
 fn is_current() -> bool {
-    let Some(dir) = pnp::current_package_dir() else {
+    let Some(dir) = store::current_package_dir() else {
         return false;
     };
     let same = |name: &str, bytes: &[u8]| std::fs::read(dir.join(name)).is_ok_and(|b| b == bytes);
-    same(DRIVER, DRIVER_BYTES) && same(INF, INF_BYTES) && sign::verify(&dir.join(pnp::CATALOG)) == 0
+    same(DRIVER, DRIVER_BYTES)
+        && same(INF, INF_BYTES)
+        && sign::verify(&dir.join(store::CATALOG)) == 0
 }
 
 /// Removes the devnode, the driver packages and the signing certificate.
@@ -70,8 +72,8 @@ pub fn uninstall() -> io::Result<()> {
     for device in Device::open_all(device::ADMIN)? {
         device?.ioctl(IOCTL_REMOVE, &[], &mut [])?;
     }
-    pnp::remove_devices()?;
-    pnp::remove_packages()?;
+    store::remove_devices()?;
+    store::remove_packages()?;
     sign::untrust()
 }
 
