@@ -10,7 +10,7 @@ Class       = System
 ClassGuid   = {4D36E97D-E325-11CE-BFC1-08002BE10318}
 Provider    = %ProviderName%
 CatalogFile = hidshimxusb.cat
-DriverVer   = 10/27/2026,0.2.0.0
+; DriverVer comes from StampInf at build time.
 PnpLockdown = 1
 
 [DestinationDirs]
@@ -23,9 +23,10 @@ DefaultDestDir = 13
 hidshimxusb.dll = 1
 
 [Manufacturer]
-%ManufacturerName% = Standard,NTamd64
+; Windows 10 1803: UMDF binaries in the driver store (DIRID 13).
+%ManufacturerName% = Standard,NTamd64.10.0...17134
 
-[Standard.NTamd64]
+[Standard.NTamd64.10.0...17134]
 %DeviceDesc% = Pad_Install, SWD\HIDSHIM_XUSB
 
 [Pad_Install.NT]

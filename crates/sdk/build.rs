@@ -16,7 +16,7 @@ fn main() {
         println!("cargo:rerun-if-changed={}", path.display());
         if !path.exists() {
             panic!(
-                "{} is missing: run drivers/build.ps1 first, or set HIDSHIM_DRIVER_DIR",
+                "{} is missing: build drivers/xusb/hidshimxusb.vcxproj first, or set HIDSHIM_DRIVER_DIR",
                 path.display()
             );
         }

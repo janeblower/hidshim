@@ -36,13 +36,17 @@ takes a fraction of a second.
 
 ## Build
 
-Requires the MSVC x64 build tools. The WDK and Windows SDK are fetched as
-pinned NuGet packages into `.wdk`.
+Requires the MSVC x64 build tools. The WDK and Windows SDK come as NuGet
+packages pinned by `drivers/xusb/packages.lock.json`. From a Developer
+PowerShell:
 
 ```
-powershell -File drivers/build.ps1
+msbuild drivers/xusb/hidshimxusb.vcxproj -restore -p:Configuration=Release -p:Platform=x64
 cargo build --release
 ```
+
+The driver build also stamps the INF with the workspace version and checks it
+with InfVerif and the driver with ApiValidator.
 
 ## Try it
 
@@ -67,7 +71,7 @@ whether it is on and needs no elevation.
 
 `cargo test` needs nothing installed. The tests in `crates/sdk/tests` install,
 drive and remove the real driver, so they run from an elevated prompt after
-`drivers/build.ps1`:
+building the driver:
 
 ```
 cargo test -p hidshim --features install --test driver -- --ignored --test-threads=1

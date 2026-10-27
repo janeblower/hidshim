@@ -1,6 +1,6 @@
 //! Against the real driver: `cargo test -p hidshim --features install --
 //! --ignored --test-threads=1` from an elevated prompt, after
-//! drivers/build.ps1. Each test leaves hidshim installed.
+//! building the driver. Each test leaves hidshim installed.
 #![cfg(all(windows, feature = "install"))]
 
 use hidshim::{Buttons, Gamepad, State, Status};

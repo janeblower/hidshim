@@ -1,0 +1,116 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The XUSB pad driver. The WDK and the Windows SDK come from NuGet, so only the
+  MSVC build tools need to be installed:
+
+    msbuild drivers\xusb\hidshimxusb.vcxproj -restore -p:Configuration=Release -p:Platform=x64
+
+  The driver toolsets of the WDK need its Visual Studio component, which Build
+  Tools cannot take, so this is a plain C++ project that points at the
+  packages and runs StampInf, InfVerif and ApiValidator itself.
+-->
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{8E8D18B2-8EE0-4019-A7D9-6D80CBEC0819}</ProjectGuid>
+    <RootNamespace>hidshimxusb</RootNamespace>
+    <RepoRoot>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..\..\'))</RepoRoot>
+    <BaseIntermediateOutputPath>$(RepoRoot)target\drivers\obj\xusb\</BaseIntermediateOutputPath>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <!-- The project.json-era asset resolver knows no native framework. -->
+    <ResolveNuGetPackages>false</ResolveNuGetPackages>
+    <WdkVersion>10.0.26100.6584</WdkVersion>
+    <KitVersion>10.0.26100.0</KitVersion>
+    <UmdfVersionMinor>15</UmdfVersionMinor>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Its build assets would point the SDK at the WDK; the SDK package
+         sets itself up instead. -->
+    <PackageReference Include="Microsoft.Windows.WDK.x64" Version="[$(WdkVersion)]" GeneratePathProperty="true" ExcludeAssets="build" />
+    <PackageReference Include="Microsoft.Windows.SDK.CPP.x64" Version="[$(WdkVersion)]" />
+    <PackageReference Include="Microsoft.Windows.SDK.CPP" Version="[$(WdkVersion)]" />
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <PlatformToolset>$(DefaultPlatformToolset)</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+
+  <PropertyGroup>
+    <OutDir>$(RepoRoot)target\drivers\xusb\</OutDir>
+    <IntDir>$(BaseIntermediateOutputPath)$(Configuration)\</IntDir>
+    <TargetName>hidshimxusb</TargetName>
+    <GenerateManifest>false</GenerateManifest>
+    <WdkRoot>$(PkgMicrosoft_Windows_WDK_x64)\c\</WdkRoot>
+    <WdkBin>$(WdkRoot)bin\$(KitVersion)\x64\</WdkBin>
+    <!-- DriverVer follows the workspace version. -->
+    <CargoVersion>$([System.Text.RegularExpressions.Regex]::Match($([System.IO.File]::ReadAllText('$(RepoRoot)Cargo.toml')), 'version = "([0-9.]+)"').Result('$1'))</CargoVersion>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <TreatWarningAsError>true</TreatWarningAsError>
+      <!-- C4324 fires inside the WDK's own wdfrequest.h. -->
+      <DisableSpecificWarnings>4324</DisableSpecificWarnings>
+      <Optimization>MaxSpeed</Optimization>
+      <BufferSecurityCheck>true</BufferSecurityCheck>
+      <CallingConvention>StdCall</CallingConvention>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+      <SDLCheck>false</SDLCheck>
+      <ConformanceMode>false</ConformanceMode>
+      <PreprocessorDefinitions>_WIN64;_AMD64_;UNICODE;_UNICODE;UMDF_VERSION_MAJOR=2;UMDF_VERSION_MINOR=$(UmdfVersionMinor)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(WdkRoot)Include\wdf\umdf\2.$(UmdfVersionMinor)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <OptimizeReferences>true</OptimizeReferences>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <AdditionalLibraryDirectories>$(WdkRoot)Lib\wdf\umdf\x64\2.$(UmdfVersionMinor)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>WdfDriverStubUm.lib;ntdll.lib;kernel32.lib;advapi32.lib</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <ClCompile Include="hidshimxusb.c" />
+    <ClInclude Include="hidshim.h" />
+    <None Include="hidshimxusb.inf" />
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+
+  <!-- The date of the last commit, not of the build, so that one commit
+       always gives the same INF; the SDK embeds it and compares bytes. -->
+  <Target Name="StampInf" AfterTargets="Build">
+    <Exec Command="git log -1 --format=%25%25cd --date=format:%25%25m/%25%25d/%25%25Y" WorkingDirectory="$(RepoRoot)" ConsoleToMSBuild="true" ContinueOnError="true" StandardOutputImportance="low">
+      <Output TaskParameter="ConsoleOutput" PropertyName="CommitDate" />
+    </Exec>
+    <PropertyGroup>
+      <DriverDate>$(CommitDate.Trim())</DriverDate>
+      <DriverDate Condition="!$([System.Text.RegularExpressions.Regex]::IsMatch('$(DriverDate)', '^\d\d/\d\d/\d{4}$'))">*</DriverDate>
+    </PropertyGroup>
+    <Copy SourceFiles="hidshimxusb.inf" DestinationFolder="$(OutDir)" />
+    <Exec Command="&quot;$(WdkBin)stampinf.exe&quot; -f &quot;$(OutDir)hidshimxusb.inf&quot; -d $(DriverDate) -v $(CargoVersion).0 -u 2.$(UmdfVersionMinor).0" />
+  </Target>
+
+  <Target Name="InfVerif" AfterTargets="StampInf">
+    <Exec Command="&quot;$(WdkRoot)tools\$(KitVersion)\x64\infverif.exe&quot; &quot;$(OutDir)hidshimxusb.inf&quot;" />
+  </Target>
+
+  <!-- Universal: the driver calls only APIs that every Windows edition has. -->
+  <Target Name="ApiValidator" AfterTargets="Build">
+    <Exec Command="&quot;$(WdkBin)apivalidator.exe&quot; -DriverPackagePath:&quot;$(OutDir)$(TargetName)$(TargetExt)&quot; -SupportedApiXmlFiles:&quot;$(WdkRoot)build\$(KitVersion)\universalDDIs\x64\UniversalDDIs.xml&quot; -ApiExtractorExePath:&quot;$(WdkBin.TrimEnd('\'))&quot;" />
+  </Target>
+</Project>

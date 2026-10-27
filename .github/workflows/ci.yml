@@ -13,14 +13,14 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - uses: microsoft/setup-msbuild@v2
       - uses: actions/cache@v6
         with:
-          path: .wdk
-          key: wdk-${{ hashFiles('drivers/build.ps1') }}
+          path: ~/.nuget/packages
+          key: nuget-${{ hashFiles('drivers/**/packages.lock.json') }}
 
       - run: cargo fmt --all --check
-      - run: ./drivers/build.ps1
-        shell: pwsh
+      - run: msbuild drivers/xusb/hidshimxusb.vcxproj -restore -p:Configuration=Release -p:Platform=x64 -p:RestoreLockedMode=true
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       # The client alone must build without the driver.
       - run: cargo check -p hidshim --locked
