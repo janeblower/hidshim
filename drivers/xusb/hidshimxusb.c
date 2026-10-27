@@ -46,7 +46,18 @@ static const GUID HID_GUID =
 #define PAD_VID 0x045E
 #define PAD_PID 0x028E
 
+typedef struct PAD_CTX PAD_CTX;
+
+/* The owner's section and the event it sets when the driver waits. */
 typedef struct {
+    PAD_CTX *Ctx;
+    HANDLE Section;
+    volatile HIDSHIM_SHARED *View;
+    HANDLE Event;
+    PTP_WAIT Wait;
+} MAPPING;
+
+struct PAD_CTX {
     /* Serializes ownership changes with the interface state that follows
      * them, and guards InterfacesCreated. */
     WDFWAITLOCK OwnerLock;
@@ -58,7 +69,9 @@ typedef struct {
     HIDSHIM_GAMEPAD_REPORT Report;
     ULONG Packet;
     WDFQUEUE WaitQueue;
-} PAD_CTX;
+    WDFQUEUE HoldQueue;
+    MAPPING *Mapping;
+};
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(PAD_CTX, GetPadCtx)
 
@@ -110,6 +123,8 @@ NTSTATUS PadDeviceAdd(_In_ WDFDRIVER Driver, _Inout_ PWDFDEVICE_INIT DeviceInit)
 
     WDF_IO_QUEUE_CONFIG_INIT(&queueConfig, WdfIoQueueDispatchManual);
     status = WdfIoQueueCreate(device, &queueConfig, WDF_NO_OBJECT_ATTRIBUTES, &ctx->WaitQueue);
+    if (!NT_SUCCESS(status)) return status;
+    status = WdfIoQueueCreate(device, &queueConfig, WDF_NO_OBJECT_ATTRIBUTES, &ctx->HoldQueue);
     if (!NT_SUCCESS(status)) return status;
 
     UNICODE_STRING reference;
@@ -218,6 +233,22 @@ static VOID CompleteWait(PAD_CTX *ctx, WDFREQUEST Request)
     CompleteWithData(Request, state, sizeof(state), sizeof(state));
 }
 
+/* Caller holds ctx->Lock. Tells the owner whether a report must wake the
+ * driver. A wait cancelled since only costs the owner one needless wake. */
+static VOID SetWaitingLocked(PAD_CTX *ctx, BOOLEAN waiting)
+{
+    if (ctx->Mapping == NULL) return;
+    InterlockedExchange((volatile LONG *)&ctx->Mapping->View->Waiting, waiting);
+}
+
+/* Caller holds ctx->Lock. */
+static VOID RefreshWaitingLocked(PAD_CTX *ctx)
+{
+    ULONG parked = 0;
+    WdfIoQueueGetState(ctx->WaitQueue, &parked, NULL);
+    SetWaitingLocked(ctx, parked != 0);
+}
+
 /* Caller holds ctx->Lock. */
 static VOID PublishLocked(PAD_CTX *ctx, const HIDSHIM_GAMEPAD_REPORT *report)
 {
@@ -228,6 +259,93 @@ static VOID PublishLocked(PAD_CTX *ctx, const HIDSHIM_GAMEPAD_REPORT *report)
     while (NT_SUCCESS(WdfIoQueueRetrieveNextRequest(ctx->WaitQueue, &waiting))) {
         CompleteWait(ctx, waiting);
     }
+    SetWaitingLocked(ctx, FALSE);
+}
+
+/* Caller holds ctx->Lock. Any bytes are a valid report, so a writer that
+ * never settles only costs a stale report, not a wrong one. */
+static VOID SyncSharedLocked(PAD_CTX *ctx)
+{
+    volatile const HIDSHIM_SHARED *shared;
+    HIDSHIM_GAMEPAD_REPORT report;
+    if (ctx->Mapping == NULL) return;
+    shared = ctx->Mapping->View;
+    for (int attempt = 0; attempt < 16; attempt++) {
+        ULONG before = ReadAcquire((volatile LONG *)&shared->Sequence);
+        if (before & 1) {
+            YieldProcessor();
+            continue;
+        }
+        /* Volatile word loads stay between the two reads of Sequence. */
+        for (int word = 0; word < sizeof(report) / sizeof(ULONG); word++) {
+            ((ULONG *)&report)[word] = ((volatile const ULONG *)&shared->Report)[word];
+        }
+        if ((ULONG)ReadAcquire((volatile LONG *)&shared->Sequence) == before) {
+            PublishLocked(ctx, &report);
+            return;
+        }
+    }
+}
+
+static VOID CALLBACK MappingWoken(
+    PTP_CALLBACK_INSTANCE Instance, PVOID Context, PTP_WAIT Wait, TP_WAIT_RESULT WaitResult)
+{
+    MAPPING *mapping = Context;
+    PAD_CTX *ctx = mapping->Ctx;
+    UNREFERENCED_PARAMETER(Instance);
+    UNREFERENCED_PARAMETER(WaitResult);
+
+    WdfWaitLockAcquire(ctx->Lock, NULL);
+    /* Unmapped meanwhile: DestroyMapping is waiting for this callback. */
+    if (ctx->Mapping == mapping) {
+        SyncSharedLocked(ctx);
+        RefreshWaitingLocked(ctx);
+        SetThreadpoolWait(Wait, mapping->Event, NULL);
+    }
+    WdfWaitLockRelease(ctx->Lock);
+}
+
+/* Without ctx->Lock held: a running MappingWoken takes it. */
+static VOID DestroyMapping(MAPPING *mapping)
+{
+    if (mapping == NULL) return;
+    if (mapping->Wait != NULL) {
+        SetThreadpoolWait(mapping->Wait, NULL, NULL);
+        WaitForThreadpoolWaitCallbacks(mapping->Wait, TRUE);
+        CloseThreadpoolWait(mapping->Wait);
+    }
+    if (mapping->Event != NULL) CloseHandle(mapping->Event);
+    if (mapping->View != NULL) UnmapViewOfFile((LPCVOID)mapping->View);
+    if (mapping->Section != NULL) CloseHandle(mapping->Section);
+    HeapFree(GetProcessHeap(), 0, mapping);
+}
+
+static MAPPING *CreateMapping(PAD_CTX *ctx)
+{
+    MAPPING *mapping = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*mapping));
+    if (mapping == NULL) return NULL;
+    mapping->Ctx = ctx;
+    /* Backed by the paging file: a file-backed view could fault on a read. */
+    mapping->Section = CreateFileMappingW(
+        INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, sizeof(HIDSHIM_SHARED), NULL);
+    if (mapping->Section != NULL) {
+        mapping->View = MapViewOfFile(mapping->Section, FILE_MAP_WRITE, 0, 0, sizeof(HIDSHIM_SHARED));
+    }
+    mapping->Event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    mapping->Wait = CreateThreadpoolWait(MappingWoken, mapping, NULL);
+    if (mapping->View == NULL || mapping->Event == NULL || mapping->Wait == NULL) {
+        DestroyMapping(mapping);
+        return NULL;
+    }
+    return mapping;
+}
+
+/* Caller holds ctx->Lock and destroys the returned mapping after releasing it. */
+static MAPPING *UnmapLocked(PAD_CTX *ctx)
+{
+    MAPPING *mapping = ctx->Mapping;
+    ctx->Mapping = NULL;
+    return mapping;
 }
 
 VOID PadFileCreate(_In_ WDFDEVICE Device, _In_ WDFREQUEST Request, _In_ WDFFILEOBJECT FileObject)
@@ -275,6 +393,7 @@ VOID PadFileCleanup(_In_ WDFFILEOBJECT FileObject)
     PAD_CTX *ctx = GetPadCtx(WdfFileObjectGetDevice(FileObject));
     HIDSHIM_GAMEPAD_REPORT neutral;
     BOOLEAN released = FALSE;
+    MAPPING *unmapped = NULL;
 
     if (!GetFileCtx(FileObject)->Control) return;
 
@@ -283,6 +402,7 @@ VOID PadFileCleanup(_In_ WDFFILEOBJECT FileObject)
     WdfWaitLockAcquire(ctx->Lock, NULL);
     if (ctx->Owner == FileObject) {
         WDFREQUEST waiting;
+        unmapped = UnmapLocked(ctx);
         PublishLocked(ctx, &neutral);
         ctx->Owner = NULL;
         ctx->OwnerProcessId = 0;
@@ -291,8 +411,12 @@ VOID PadFileCleanup(_In_ WDFFILEOBJECT FileObject)
         while (NT_SUCCESS(WdfIoQueueRetrieveNextRequest(ctx->WaitQueue, &waiting))) {
             WdfRequestComplete(waiting, STATUS_DEVICE_REMOVED);
         }
+        while (NT_SUCCESS(WdfIoQueueRetrieveRequestByFileObject(ctx->HoldQueue, FileObject, &waiting))) {
+            WdfRequestComplete(waiting, STATUS_SUCCESS);
+        }
     }
     WdfWaitLockRelease(ctx->Lock);
+    DestroyMapping(unmapped);
     if (released) {
         HidePad(WdfFileObjectGetDevice(FileObject));
     }
@@ -318,18 +442,122 @@ static VOID HandleSetReport(PAD_CTX *ctx, WDFREQUEST Request)
     WdfRequestComplete(Request, status);
 }
 
+typedef struct {
+    ULONG ProcessId;
+    HANDLE Process;
+} OPEN_OWNER;
+
+/* WUDFHost runs as LocalService, which may not open the owner's process; the
+ * owner itself may. */
+static VOID OpenOwner(_In_ WDFREQUEST Request, _In_opt_ PVOID Context)
+{
+    OPEN_OWNER *owner = Context;
+    UNREFERENCED_PARAMETER(Request);
+    owner->Process = OpenProcess(PROCESS_DUP_HANDLE, FALSE, owner->ProcessId);
+}
+
+static BOOLEAN IsOwnerLocked(PAD_CTX *ctx, WDFREQUEST Request)
+{
+    return ctx->Owner != NULL && ctx->Owner == WdfRequestGetFileObject(Request);
+}
+
+/* Puts the mapping's section and event into the requestor's process. */
+static NTSTATUS GiveMapping(WDFREQUEST Request, MAPPING *mapping, HIDSHIM_MAPPING *given)
+{
+    HANDLE section, event;
+    OPEN_OWNER owner = { WdfRequestGetRequestorProcessId(Request), NULL };
+    NTSTATUS status = WdfRequestImpersonate(Request, SecurityImpersonation, OpenOwner, &owner);
+    if (!NT_SUCCESS(status)) return status;
+    if (owner.Process == NULL) return STATUS_ACCESS_DENIED;
+    status = STATUS_INSUFFICIENT_RESOURCES;
+    if (DuplicateHandle(GetCurrentProcess(), mapping->Section, owner.Process, &section,
+                        FILE_MAP_READ | FILE_MAP_WRITE, FALSE, 0)) {
+        /* The owner may only set the event, not wait on it or reset it. */
+        if (DuplicateHandle(GetCurrentProcess(), mapping->Event, owner.Process, &event,
+                            EVENT_MODIFY_STATE, FALSE, 0)) {
+            given->Section = (ULONG64)(ULONG_PTR)section;
+            given->Event = (ULONG64)(ULONG_PTR)event;
+            status = STATUS_SUCCESS;
+        } else {
+            DuplicateHandle(owner.Process, section, NULL, NULL, 0, FALSE, DUPLICATE_CLOSE_SOURCE);
+        }
+    }
+    CloseHandle(owner.Process);
+    return status;
+}
+
+static VOID HandleMapReport(PAD_CTX *ctx, WDFREQUEST Request)
+{
+    HIDSHIM_MAPPING *given;
+    MAPPING *mapping;
+    NTSTATUS status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*given), (PVOID *)&given, NULL);
+    if (!NT_SUCCESS(status)) {
+        WdfRequestComplete(Request, STATUS_BUFFER_TOO_SMALL);
+        return;
+    }
+    WdfWaitLockAcquire(ctx->Lock, NULL);
+    status = !IsOwnerLocked(ctx, Request) ? STATUS_ACCESS_DENIED
+        : ctx->Mapping != NULL ? STATUS_DEVICE_BUSY : STATUS_SUCCESS;
+    WdfWaitLockRelease(ctx->Lock);
+    if (!NT_SUCCESS(status)) {
+        WdfRequestComplete(Request, status);
+        return;
+    }
+
+    mapping = CreateMapping(ctx);
+    if (mapping == NULL) {
+        WdfRequestComplete(Request, STATUS_INSUFFICIENT_RESOURCES);
+        return;
+    }
+    /* The section starts zeroed: the neutral report the claim published. */
+    WdfWaitLockAcquire(ctx->Lock, NULL);
+    status = !IsOwnerLocked(ctx, Request) ? STATUS_ACCESS_DENIED
+        : ctx->Mapping != NULL ? STATUS_DEVICE_BUSY : STATUS_SUCCESS;
+    if (NT_SUCCESS(status)) {
+        status = GiveMapping(Request, mapping, given);
+    }
+    if (NT_SUCCESS(status)) {
+        ctx->Mapping = mapping;
+        mapping = NULL;
+        RefreshWaitingLocked(ctx);
+        SetThreadpoolWait(ctx->Mapping->Wait, ctx->Mapping->Event, NULL);
+    }
+    WdfWaitLockRelease(ctx->Lock);
+    DestroyMapping(mapping);
+    if (NT_SUCCESS(status)) {
+        WdfRequestCompleteWithInformation(Request, status, sizeof(*given));
+    } else {
+        WdfRequestComplete(Request, status);
+    }
+}
+
+static VOID HandleHold(PAD_CTX *ctx, WDFREQUEST Request)
+{
+    NTSTATUS status;
+    WdfWaitLockAcquire(ctx->Lock, NULL);
+    status = IsOwnerLocked(ctx, Request)
+        ? WdfRequestForwardToIoQueue(Request, ctx->HoldQueue)
+        : STATUS_ACCESS_DENIED;
+    WdfWaitLockRelease(ctx->Lock);
+    if (!NT_SUCCESS(status)) WdfRequestComplete(Request, status);
+}
+
 static VOID HandleWaitForInput(PAD_CTX *ctx, WDFREQUEST Request)
 {
     WDFFILEOBJECT file = WdfRequestGetFileObject(Request);
     NTSTATUS status;
 
     /* Pending under the lock: a report published in between would
-     * otherwise leave this request parked until the next change. */
+     * otherwise leave this request parked until the next change. Waiting
+     * goes up first, so the owner either sees it or wrote before the sync. */
     WdfWaitLockAcquire(ctx->Lock, NULL);
+    SetWaitingLocked(ctx, TRUE);
+    SyncSharedLocked(ctx);
     if (ctx->Owner == NULL) {
         status = STATUS_DEVICE_NOT_CONNECTED;
     } else if (file != NULL && GetFileCtx(file)->SeenPacket != ctx->Packet) {
         CompleteWait(ctx, Request);
+        RefreshWaitingLocked(ctx);
         WdfWaitLockRelease(ctx->Lock);
         return;
     } else {
@@ -441,7 +669,9 @@ VOID PadIoControl(
 
     switch (IoControlCode) {
     case IOCTL_HIDSHIM_GET_VERSION: {
-        HIDSHIM_VERSION version = { HIDSHIM_PROTOCOL_VERSION, HIDSHIM_CAP_PAD_INFO };
+        HIDSHIM_VERSION version = {
+            HIDSHIM_PROTOCOL_VERSION, HIDSHIM_CAP_PAD_INFO | HIDSHIM_CAP_MAP_REPORT
+        };
         CompleteWithData(Request, &version, sizeof(version), sizeof(version));
         break;
     }
@@ -458,6 +688,14 @@ VOID PadIoControl(
 
     case IOCTL_HIDSHIM_SET_REPORT:
         HandleSetReport(ctx, Request);
+        break;
+
+    case IOCTL_HIDSHIM_MAP_REPORT:
+        HandleMapReport(ctx, Request);
+        break;
+
+    case IOCTL_HIDSHIM_HOLD:
+        HandleHold(ctx, Request);
         break;
 
     case IOCTL_HIDSHIM_REMOVE:
@@ -492,6 +730,7 @@ VOID PadIoControl(
     case IOCTL_XUSB_GET_STATE: {
         UCHAR state[XUSB_STATE_SIZE];
         WdfWaitLockAcquire(ctx->Lock, NULL);
+        SyncSharedLocked(ctx);
         BuildState(ctx, FALSE, state);
         WdfWaitLockRelease(ctx->Lock);
         CompleteWithData(Request, state, sizeof(state), sizeof(state));
