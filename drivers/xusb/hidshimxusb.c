@@ -54,6 +54,7 @@ typedef struct {
     /* Guards everything below. */
     WDFWAITLOCK Lock;
     WDFFILEOBJECT Owner;
+    ULONG OwnerProcessId;
     HIDSHIM_GAMEPAD_REPORT Report;
     ULONG Packet;
     WDFQUEUE WaitQueue;
@@ -251,6 +252,7 @@ VOID PadFileCreate(_In_ WDFDEVICE Device, _In_ WDFREQUEST Request, _In_ WDFFILEO
         status = STATUS_DEVICE_BUSY;
     } else {
         ctx->Owner = FileObject;
+        ctx->OwnerProcessId = WdfRequestGetRequestorProcessId(Request);
         RtlZeroMemory(&ctx->Report, sizeof(ctx->Report));
         ctx->Packet++;
     }
@@ -260,6 +262,7 @@ VOID PadFileCreate(_In_ WDFDEVICE Device, _In_ WDFREQUEST Request, _In_ WDFFILEO
         if (!NT_SUCCESS(status)) {
             WdfWaitLockAcquire(ctx->Lock, NULL);
             ctx->Owner = NULL;
+            ctx->OwnerProcessId = 0;
             WdfWaitLockRelease(ctx->Lock);
         }
     }
@@ -282,6 +285,7 @@ VOID PadFileCleanup(_In_ WDFFILEOBJECT FileObject)
         WDFREQUEST waiting;
         PublishLocked(ctx, &neutral);
         ctx->Owner = NULL;
+        ctx->OwnerProcessId = 0;
         released = TRUE;
         /* xusb22 fails parked waits this way when a controller goes away. */
         while (NT_SUCCESS(WdfIoQueueRetrieveNextRequest(ctx->WaitQueue, &waiting))) {
@@ -437,8 +441,18 @@ VOID PadIoControl(
 
     switch (IoControlCode) {
     case IOCTL_HIDSHIM_GET_VERSION: {
-        HIDSHIM_VERSION version = { HIDSHIM_PROTOCOL_VERSION, 0 };
+        HIDSHIM_VERSION version = { HIDSHIM_PROTOCOL_VERSION, HIDSHIM_CAP_PAD_INFO };
         CompleteWithData(Request, &version, sizeof(version), sizeof(version));
+        break;
+    }
+
+    case IOCTL_HIDSHIM_GET_PAD_INFO: {
+        HIDSHIM_PAD_INFO info;
+        WdfWaitLockAcquire(ctx->Lock, NULL);
+        info.Owned = ctx->Owner != NULL;
+        info.OwnerProcessId = ctx->OwnerProcessId;
+        WdfWaitLockRelease(ctx->Lock);
+        CompleteWithData(Request, &info, sizeof(info), sizeof(info));
         break;
     }
 
