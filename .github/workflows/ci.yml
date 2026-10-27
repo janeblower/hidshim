@@ -26,4 +26,6 @@ jobs:
       - run: cargo check -p hidshim --locked
       - run: cargo test --workspace --locked
       # Runners are elevated, so the driver is installed and driven for real.
-      - run: cargo test -p hidshim --features install --test driver --locked -- --ignored --test-threads=1
+      - run: cargo test -p hidshim --features install --test driver --locked -- --ignored --test-threads=1 --nocapture
+        env:
+          RUST_BACKTRACE: 1
