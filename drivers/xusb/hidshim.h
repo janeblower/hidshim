@@ -27,8 +27,20 @@
 #define IOCTL_HIDSHIM_GET_PAD_INFO \
     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
+/* Owner only, once per claim. Answers with HIDSHIM_MAPPING: handles, in the
+ * owner's process, to a HIDSHIM_SHARED section the driver reads reports from
+ * and to an event that wakes the driver. */
+#define IOCTL_HIDSHIM_MAP_REPORT \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x804, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+/* Owner only. Stays pending while the owner holds the pad and fails once the
+ * device goes away, which a writer of the section cannot see otherwise. */
+#define IOCTL_HIDSHIM_HOLD \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x805, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+
 /* HIDSHIM_VERSION.Capabilities: the driver answers IOCTL_HIDSHIM_GET_PAD_INFO. */
 #define HIDSHIM_CAP_PAD_INFO 0x1
+/* The driver answers IOCTL_HIDSHIM_MAP_REPORT and IOCTL_HIDSHIM_HOLD. */
+#define HIDSHIM_CAP_MAP_REPORT 0x2
 
 typedef struct {
     ULONG Version;
@@ -52,6 +64,26 @@ typedef struct {
     SHORT ThumbRY;
 } HIDSHIM_GAMEPAD_REPORT;
 
+typedef struct {
+    ULONG64 Section;
+    ULONG64 Event;
+} HIDSHIM_MAPPING;
+
+/*
+ * The section. The owner makes Sequence odd, writes Report, makes Sequence
+ * even, and then sets the event if Waiting is non-zero. The driver sets
+ * Waiting while XInput or WGI wait for input; both sides put a full barrier
+ * between their store and the other side's field, so a report is never left
+ * unseen with a waiter parked.
+ */
+typedef struct {
+    ULONG Sequence;
+    HIDSHIM_GAMEPAD_REPORT Report;
+    ULONG Waiting;
+} HIDSHIM_SHARED;
+
 C_ASSERT(sizeof(HIDSHIM_VERSION) == 8);
+C_ASSERT(sizeof(HIDSHIM_MAPPING) == 16);
+C_ASSERT(sizeof(HIDSHIM_SHARED) == 20);
 C_ASSERT(sizeof(HIDSHIM_PAD_INFO) == 8);
 C_ASSERT(sizeof(HIDSHIM_GAMEPAD_REPORT) == 12);

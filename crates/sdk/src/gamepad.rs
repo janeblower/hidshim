@@ -1,9 +1,10 @@
 use crate::device::{self, Device};
 use crate::pnp::{Status, status};
 use crate::proto::{
-    CAP_PAD_INFO, IOCTL_GET_PAD_INFO, IOCTL_GET_VERSION, IOCTL_SET_REPORT, PROTOCOL_VERSION,
-    PadInfo, Version,
+    CAP_MAP_REPORT, CAP_PAD_INFO, IOCTL_GET_PAD_INFO, IOCTL_GET_VERSION, IOCTL_SET_REPORT,
+    PROTOCOL_VERSION, PadInfo, Version,
 };
+use crate::shared::{Hold, SharedReport};
 use std::io;
 use std::ops::{BitOr, BitOrAssign};
 use windows_sys::Win32::Foundation::{
@@ -70,6 +71,8 @@ const _: () = assert!(size_of::<State>() == 12);
 /// returns the pad to neutral and removes it from XInput.
 #[derive(Debug)]
 pub struct Gamepad {
+    /// Declared before device: it is dropped first and borrows its handle.
+    shared: Option<SharedReport>,
     device: Device,
     index: u8,
 }
@@ -96,7 +99,7 @@ impl Gamepad {
         ))
     }
 
-    fn claimed(device: Device, index: u8) -> io::Result<Self> {
+    fn claimed(mut device: Device, index: u8) -> io::Result<Self> {
         let version: Version = device.query(IOCTL_GET_VERSION)?;
         if version.version != PROTOCOL_VERSION {
             return Err(io::Error::other(format!(
@@ -104,7 +107,16 @@ impl Gamepad {
                 version.version
             )));
         }
-        Ok(Self { device, index })
+        let shared = if version.capabilities & CAP_MAP_REPORT != 0 {
+            Some(SharedReport::new(&mut device)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            shared,
+            device,
+            index,
+        })
     }
 
     /// Which of the installed pads this is, as [`pads`] lists them.
@@ -116,6 +128,21 @@ impl Gamepad {
     /// [`io::ErrorKind::NotConnected`] once the pad has been removed, as by
     /// uninstalling; the pad is then gone for good.
     pub fn submit(&mut self, state: &State) -> io::Result<()> {
+        if let Some(shared) = &mut self.shared {
+            match shared.hold() {
+                Hold::Pending => {}
+                // A device that is gone also fails a plain request.
+                Hold::Cancelled => {
+                    let alive = self.device.query::<Version>(IOCTL_GET_VERSION).is_ok();
+                    if !alive || !shared.send_hold() {
+                        return Err(removed());
+                    }
+                }
+                Hold::Ended => return Err(removed()),
+            }
+            shared.write(state);
+            return Ok(());
+        }
         // SAFETY: State is repr(C) plain data without padding.
         let bytes = unsafe {
             std::slice::from_raw_parts((state as *const State).cast::<u8>(), size_of::<State>())
@@ -124,12 +151,14 @@ impl Gamepad {
             .ioctl(IOCTL_SET_REPORT, bytes, &mut [])
             .map_err(|e| match e.raw_os_error().map(|code| code as u32) {
                 // A failed or removed device answers with ERROR_BAD_COMMAND.
-                Some(ERROR_BAD_COMMAND | ERROR_DEVICE_REMOVED | ERROR_NO_SUCH_DEVICE) => {
-                    io::Error::new(io::ErrorKind::NotConnected, "the hidshim pad was removed")
-                }
+                Some(ERROR_BAD_COMMAND | ERROR_DEVICE_REMOVED | ERROR_NO_SUCH_DEVICE) => removed(),
                 _ => e,
             })
     }
+}
+
+fn removed() -> io::Error {
+    io::Error::new(io::ErrorKind::NotConnected, "the hidshim pad was removed")
 }
 
 /// An installed pad as [`pads`] reports it.
@@ -146,7 +175,7 @@ pub fn pads() -> io::Result<Vec<Pad>> {
     device::interfaces(device::ADMIN)?
         .iter()
         .map(|interface| {
-            let device = interface.open()?;
+            let mut device = interface.open()?;
             let version: Version = device.query(IOCTL_GET_VERSION)?;
             if version.capabilities & CAP_PAD_INFO == 0 {
                 return Err(io::Error::new(

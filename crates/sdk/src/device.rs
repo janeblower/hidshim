@@ -1,6 +1,6 @@
 //! Handles to the driver's control interfaces.
 
-use crate::proto::{CONTROL_GUID, PadInfo, Version};
+use crate::proto::{CONTROL_GUID, Mapping, PadInfo, Version};
 use crate::win::{check, cr};
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -9,18 +9,46 @@ use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     CM_GET_DEVICE_INTERFACE_LIST_PRESENT, CM_Get_Device_Interface_List_SizeW,
     CM_Get_Device_Interface_ListW, CR_BUFFER_SMALL,
 };
-use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
-use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+use windows_sys::Win32::Foundation::{
+    ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
 };
-use windows_sys::Win32::System::IO::DeviceIoControl;
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+};
+use windows_sys::Win32::System::IO::{DeviceIoControl, GetOverlappedResult, OVERLAPPED};
+use windows_sys::Win32::System::Threading::CreateEventW;
 
 /// Reference strings of the control interfaces, see drivers/xusb/hidshim.h.
 pub(crate) const CONTROL: &str = "ctl";
 pub(crate) const ADMIN: &str = "admin";
 
+/// An overlapped handle, so that a pending IOCTL_HIDSHIM_HOLD does not block
+/// the others, and the event its own requests complete on.
 #[derive(Debug)]
-pub(crate) struct Device(OwnedHandle);
+pub(crate) struct Device {
+    handle: OwnedHandle,
+    done: OwnedHandle,
+}
+
+/// An overlapped that completes on `event`.
+pub(crate) fn overlapped(event: &OwnedHandle) -> OVERLAPPED {
+    // SAFETY: OVERLAPPED is plain data; all zeroes is its initial state, in
+    // which GetOverlappedResult does not wait.
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    overlapped.hEvent = event.as_raw_handle();
+    overlapped
+}
+
+/// A manual-reset event, unsignaled.
+pub(crate) fn event() -> io::Result<OwnedHandle> {
+    // SAFETY: no name, default security; the result is checked.
+    let raw = unsafe { CreateEventW(null(), 1, 0, null()) };
+    if raw.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: raw is a fresh handle owned by nobody else.
+    Ok(unsafe { OwnedHandle::from_raw_handle(raw) })
+}
 
 /// A present control interface of one pad.
 pub(crate) struct Interface {
@@ -38,6 +66,7 @@ impl Interface {
 pub(crate) trait Reply: Default {}
 impl Reply for Version {}
 impl Reply for PadInfo {}
+impl Reply for Mapping {}
 
 impl Device {
     fn open(path: &[u16]) -> io::Result<Self> {
@@ -49,7 +78,7 @@ impl Device {
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 null(),
                 OPEN_EXISTING,
-                0,
+                FILE_FLAG_OVERLAPPED,
                 null_mut(),
             )
         };
@@ -57,31 +86,49 @@ impl Device {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: raw is a fresh handle owned by nobody else.
-        Ok(Self(unsafe { OwnedHandle::from_raw_handle(raw) }))
+        let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+        Ok(Self {
+            handle,
+            done: event()?,
+        })
     }
 
-    pub(crate) fn ioctl(&self, code: u32, input: &[u8], output: &mut [u8]) -> io::Result<()> {
+    pub(crate) fn raw(&self) -> HANDLE {
+        self.handle.as_raw_handle()
+    }
+
+    /// Sends a request and waits for it. `&mut` because requests share the
+    /// completion event.
+    pub(crate) fn ioctl(&mut self, code: u32, input: &[u8], output: &mut [u8]) -> io::Result<()> {
+        let mut overlapped = overlapped(&self.done);
         let mut returned = 0;
-        // SAFETY: buffers outlive the synchronous call; lengths match them.
-        check(unsafe {
+        // SAFETY: buffers and overlapped live until GetOverlappedResult below
+        // has waited for the request; lengths match the buffers.
+        let sent = unsafe {
             DeviceIoControl(
-                self.0.as_raw_handle(),
+                self.raw(),
                 code,
                 input.as_ptr().cast(),
                 input.len() as u32,
                 output.as_mut_ptr().cast(),
                 output.len() as u32,
-                &mut returned,
                 null_mut(),
+                &mut overlapped,
             )
-        })?;
+        };
+        // SAFETY: plain thread-local read.
+        if sent == 0 && unsafe { GetLastError() } != ERROR_IO_PENDING {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the request was started with this overlapped; bWait = TRUE.
+        check(unsafe { GetOverlappedResult(self.raw(), &overlapped, &mut returned, 1) })?;
         if returned as usize != output.len() {
             return Err(io::Error::other("short reply from hidshim driver"));
         }
         Ok(())
     }
 
-    pub(crate) fn query<T: Reply>(&self, code: u32) -> io::Result<T> {
+    pub(crate) fn query<T: Reply>(&mut self, code: u32) -> io::Result<T> {
         let mut reply = T::default();
         // SAFETY: Reply types are repr(C) plain data; any bytes are a valid value.
         let bytes = unsafe {
