@@ -1,0 +1,54 @@
+name: release
+
+on:
+  push:
+    branches: [master]
+    tags: ["[0-9]*"]
+    paths-ignore: ["**.md"]
+
+permissions:
+  contents: write
+
+concurrency: release-${{ github.ref }}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: .wdk
+          key: wdk-${{ hashFiles('drivers/build.ps1') }}
+
+      - run: ./drivers/build.ps1
+        shell: pwsh
+      - run: cargo build --release --locked -p hidshim-cli
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory dist, drivers-zip | Out-Null
+          Copy-Item target/release/hidshim.exe dist/
+          Copy-Item target/drivers/xusb/hidshimxusb.dll, target/drivers/xusb/hidshimxusb.inf, LICENSE drivers-zip/
+          Compress-Archive drivers-zip/* dist/hidshim-drivers.zip
+          Get-ChildItem dist -File | ForEach-Object {
+            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
+          } | Set-Content -Encoding ascii dist/SHA256SUMS
+
+      - name: Publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes
+          else
+            # Recreated on every merge so the pre-release stays at the top of the list.
+            gh release delete nightly --cleanup-tag --yes || true
+            gh release create nightly dist/* --prerelease --target "$GITHUB_SHA" \
+              --title "Nightly ${GITHUB_SHA::7}" --generate-notes
+          fi

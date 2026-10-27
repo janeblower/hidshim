@@ -39,6 +39,9 @@ hidshim bench              # submit -> XInputGetState latency
 hidshim uninstall          # elevated
 ```
 
+Releases carry `hidshim.exe` with the driver inside and `hidshim-drivers.zip`
+for [installing the driver by hand](docs/manual-install.md).
+
 ## License
 
 [GPL-3.0-or-later](LICENSE).
