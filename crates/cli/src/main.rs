@@ -4,34 +4,93 @@ use std::{env, io, thread};
 use windows::Gaming::Input::Gamepad as WgiGamepad;
 use windows_sys::Win32::UI::Input::XboxController::{XINPUT_STATE, XInputGetState};
 
+mod autostart;
 mod setup;
 mod window;
 
 const USAGE: &str = "usage: hidshim <command>
 
-  install          install or update hidshim and its driver, or bring the
-                   pad back after a reboot (asks for administrator rights)
-  uninstall        remove hidshim, its driver and certificate (asks for
-                   administrator rights)
-  status           whether the driver is installed and the pad is running
-  pad [seconds]    hold the pad and play a test pattern (default 30)
+  install [--no-autostart]
+                   install or update hidshim and its driver, or bring the
+                   pads back after a reboot; unless told otherwise, also
+                   bring them back on every boot (asks for administrator
+                   rights)
+  uninstall        remove hidshim, its driver, certificate and boot task
+                   (asks for administrator rights)
+  autostart [on|off]
+                   whether the pads come back on boot, or turn that on or
+                   off (asks for administrator rights)
+  status           whether the driver is installed and the pads are running
+  list             the pads and the processes holding them
+  pad [seconds]    hold a pad and play a test pattern (default 30)
   watch [seconds]  print what XInput and Windows.Gaming.Input see (default 30)
   bench [count]    latency from submit to XInputGetState (default 1000)";
 
+#[derive(Debug, PartialEq)]
+enum Command {
+    Install { autostart: bool },
+    Uninstall,
+    Autostart(Option<bool>),
+    Restore,
+    Status,
+    List,
+    Pad(Duration),
+    Watch(Duration),
+    Bench(usize),
+}
+
+fn parse(args: &[String]) -> Option<Command> {
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let number = |default: u64| match args.get(1) {
+        None => Some(default),
+        Some(text) => text.parse().ok(),
+    };
+    if args.len() > 2 {
+        return None;
+    }
+    Some(match *args.first()? {
+        "install" => match args.get(1) {
+            None => Command::Install { autostart: true },
+            Some(&"--no-autostart") => Command::Install { autostart: false },
+            Some(_) => return None,
+        },
+        "uninstall" if args.len() == 1 => Command::Uninstall,
+        "autostart" => Command::Autostart(match args.get(1) {
+            None => None,
+            Some(&"on") => Some(true),
+            Some(&"off") => Some(false),
+            Some(_) => return None,
+        }),
+        // Run by the boot task, as SYSTEM.
+        "restore" if args.len() == 1 => Command::Restore,
+        "status" if args.len() == 1 => Command::Status,
+        "list" if args.len() == 1 => Command::List,
+        "pad" => Command::Pad(Duration::from_secs(number(30)?)),
+        "watch" => Command::Watch(Duration::from_secs(number(30)?)),
+        "bench" => Command::Bench(usize::try_from(number(1000)?).ok()?),
+        _ => return None,
+    })
+}
+
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
-    let number = |default: u64| args.get(1).and_then(|s| s.parse().ok()).unwrap_or(default);
-    let result = match args.first().map(String::as_str) {
-        Some("install") => elevated(setup::install),
-        Some("uninstall") => elevated(setup::uninstall),
-        Some("status") => status(),
-        Some("pad") => pad(Duration::from_secs(number(30))),
-        Some("watch") => watch(Duration::from_secs(number(30))),
-        Some("bench") => bench(number(1000) as usize),
-        _ => {
-            eprintln!("{USAGE}");
-            std::process::exit(2);
-        }
+    let Some(command) = parse(&args) else {
+        eprintln!("{USAGE}");
+        std::process::exit(2);
+    };
+    let result = match command {
+        Command::Install { autostart } => elevated(|| setup::install(autostart)),
+        Command::Uninstall => elevated(setup::uninstall),
+        Command::Autostart(None) => autostart::enabled().map(|on| {
+            println!("{}", if on { "on" } else { "off" });
+        }),
+        Command::Autostart(Some(on)) => elevated(|| setup::set_autostart(on)),
+        Command::Restore => hidshim::restore(),
+        Command::Status => status(),
+        Command::List => list(),
+        Command::Pad(duration) => pad(duration),
+        Command::Watch(duration) => watch(duration),
+        Command::Bench(count) => bench(count),
     };
     if let Err(e) = result {
         eprintln!("error: {e}");
@@ -39,7 +98,7 @@ fn main() {
     }
 }
 
-fn elevated(run: fn() -> io::Result<()>) -> io::Result<()> {
+fn elevated(run: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
     match setup::relaunch_elevated()? {
         None => run(),
         Some(0) => Ok(()),
@@ -54,16 +113,33 @@ fn status() -> io::Result<()> {
         "{}",
         match hidshim::status()? {
             Status::NotInstalled => "not installed",
-            Status::NotPresent => "installed, pad not running (run install to bring it back)",
+            Status::NotPresent => "installed, pads not running (run install to bring them back)",
             Status::Ready => "ready",
         }
     );
     Ok(())
 }
 
+fn list() -> io::Result<()> {
+    let pads = hidshim::pads()?;
+    if pads.is_empty() {
+        println!("no pads running");
+    }
+    for pad in pads {
+        match pad.owner {
+            None => println!("pad {}: free", pad.index),
+            Some(pid) => match setup::process_name(pid) {
+                Some(name) => println!("pad {}: held by {name} ({pid})", pad.index),
+                None => println!("pad {}: held by process {pid}", pad.index),
+            },
+        }
+    }
+    Ok(())
+}
+
 fn pad(duration: Duration) -> io::Result<()> {
     let mut pad = Gamepad::open()?;
-    println!("pad open for {}s", duration.as_secs());
+    println!("pad {} open for {}s", pad.index(), duration.as_secs());
     let start = Instant::now();
     while start.elapsed() < duration {
         let t = start.elapsed().as_secs_f32();
@@ -196,4 +272,59 @@ fn report(name: &str, samples: &mut [Duration]) {
         at(0.99),
         at(1.0)
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parsed(line: &str) -> Option<Command> {
+        let args: Vec<String> = line.split_whitespace().map(String::from).collect();
+        parse(&args)
+    }
+
+    #[test]
+    fn install_sets_up_autostart_unless_told_not_to() {
+        assert_eq!(
+            parsed("install"),
+            Some(Command::Install { autostart: true })
+        );
+        assert_eq!(
+            parsed("install --no-autostart"),
+            Some(Command::Install { autostart: false })
+        );
+        assert_eq!(parsed("install --autostart"), None);
+    }
+
+    #[test]
+    fn autostart_reports_or_switches() {
+        assert_eq!(parsed("autostart"), Some(Command::Autostart(None)));
+        assert_eq!(parsed("autostart on"), Some(Command::Autostart(Some(true))));
+        assert_eq!(
+            parsed("autostart off"),
+            Some(Command::Autostart(Some(false)))
+        );
+        assert_eq!(parsed("autostart yes"), None);
+    }
+
+    #[test]
+    fn numbers_default_and_must_parse() {
+        assert_eq!(parsed("pad"), Some(Command::Pad(Duration::from_secs(30))));
+        assert_eq!(
+            parsed("watch 5"),
+            Some(Command::Watch(Duration::from_secs(5)))
+        );
+        assert_eq!(parsed("bench"), Some(Command::Bench(1000)));
+        assert_eq!(parsed("bench many"), None);
+    }
+
+    #[test]
+    fn unknown_or_extra_arguments_show_usage() {
+        assert_eq!(parsed(""), None);
+        assert_eq!(parsed("frobnicate"), None);
+        assert_eq!(parsed("status now"), None);
+        assert_eq!(parsed("pad 1 2"), None);
+        assert_eq!(parsed("restore"), Some(Command::Restore));
+        assert_eq!(parsed("list"), Some(Command::List));
+    }
 }
