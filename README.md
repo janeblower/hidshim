@@ -14,7 +14,10 @@ drop(pad);                                // neutral, then gone from XInput
 `install` signs the driver package on the machine with a fresh self-signed
 certificate whose key exists only in memory during signing, trusts that
 certificate in `LocalMachine\Root` and `TrustedPublisher`, and creates the
-`ROOT\HIDSHIM_XUSB` devnode. `uninstall` removes all three.
+`SWD\HIDSHIM\XUSB` software device. `uninstall` removes all three.
+
+The software device does not survive a reboot. Running `install` again
+afterwards only recreates it, which takes a fraction of a second.
 
 ## Build
 
@@ -35,3 +38,7 @@ hidshim pad                # test pattern, in another terminal
 hidshim bench              # submit -> XInputGetState latency
 hidshim uninstall          # elevated
 ```
+
+## License
+
+[GPL-3.0-or-later](LICENSE).

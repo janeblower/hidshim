@@ -3,6 +3,7 @@ name = "hidshim-cli"
 description = "Installs hidshim and checks the pad through XInput and Windows.Gaming.Input"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [[bin]]
 name = "hidshim"
