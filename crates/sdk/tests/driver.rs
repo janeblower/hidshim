@@ -94,6 +94,23 @@ fn xinput_sees_submitted_state_until_drop() {
 
 #[test]
 #[ignore = "needs administrator rights and the built driver"]
+fn pad_outlives_the_thread_that_opened_it() {
+    installed();
+    let mut pad = std::thread::spawn(|| Gamepad::open().unwrap())
+        .join()
+        .unwrap();
+    pad.submit(&State {
+        buttons: Buttons::X,
+        ..State::default()
+    })
+    .unwrap();
+    eventually("state from a pad opened elsewhere", || {
+        xinput_buttons().contains(&Buttons::X.0)
+    });
+}
+
+#[test]
+#[ignore = "needs administrator rights and the built driver"]
 fn restore_and_reinstall_keep_the_pads() {
     installed();
     hidshim::restore().unwrap();

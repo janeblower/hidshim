@@ -14,6 +14,7 @@ mod gamepad;
 mod install;
 mod pnp;
 mod proto;
+mod shared;
 #[cfg(feature = "install")]
 mod sign;
 #[cfg(feature = "install")]
