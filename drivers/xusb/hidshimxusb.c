@@ -305,6 +305,15 @@ static VOID CALLBACK MappingWoken(
     WdfWaitLockRelease(ctx->Lock);
 }
 
+/* Caller holds ctx->Lock. */
+static VOID FailWaitsLocked(PAD_CTX *ctx, NTSTATUS status)
+{
+    WDFREQUEST waiting;
+    while (NT_SUCCESS(WdfIoQueueRetrieveNextRequest(ctx->WaitQueue, &waiting))) {
+        WdfRequestComplete(waiting, status);
+    }
+}
+
 /* Without ctx->Lock held: a running MappingWoken takes it. */
 static VOID DestroyMapping(MAPPING *mapping)
 {
@@ -381,6 +390,8 @@ VOID PadFileCreate(_In_ WDFDEVICE Device, _In_ WDFREQUEST Request, _In_ WDFFILEO
             WdfWaitLockAcquire(ctx->Lock, NULL);
             ctx->Owner = NULL;
             ctx->OwnerProcessId = 0;
+            /* Waits that saw the owner while the pad was being shown. */
+            FailWaitsLocked(ctx, STATUS_DEVICE_NOT_CONNECTED);
             WdfWaitLockRelease(ctx->Lock);
         }
     }
@@ -408,9 +419,7 @@ VOID PadFileCleanup(_In_ WDFFILEOBJECT FileObject)
         ctx->OwnerProcessId = 0;
         released = TRUE;
         /* xusb22 fails parked waits this way when a controller goes away. */
-        while (NT_SUCCESS(WdfIoQueueRetrieveNextRequest(ctx->WaitQueue, &waiting))) {
-            WdfRequestComplete(waiting, STATUS_DEVICE_REMOVED);
-        }
+        FailWaitsLocked(ctx, STATUS_DEVICE_REMOVED);
         while (NT_SUCCESS(WdfIoQueueRetrieveRequestByFileObject(ctx->HoldQueue, FileObject, &waiting))) {
             WdfRequestComplete(waiting, STATUS_SUCCESS);
         }
