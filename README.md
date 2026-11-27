@@ -44,6 +44,15 @@ powershell -File drivers/build.ps1
 cargo build --release
 ```
 
+ARM64 is experimental: it is built, but not yet tested on hardware. It needs
+the MSVC ARM64 build tools as well; releases carry it as `hidshim-arm64.exe`
+and `hidshim-drivers-arm64.zip`.
+
+```
+powershell -File drivers/build.ps1 -Arch x64, arm64
+cargo build --release --target aarch64-pc-windows-msvc
+```
+
 ## Try it
 
 ```

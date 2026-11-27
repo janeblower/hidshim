@@ -17,24 +17,31 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
       - uses: actions/cache@v6
         with:
           path: .wdk
           key: wdk-${{ hashFiles('drivers/build.ps1') }}
 
-      - run: ./drivers/build.ps1
+      - run: ./drivers/build.ps1 -Arch x64, arm64
         shell: pwsh
       - run: cargo build --release --locked -p hidshim-cli
+      # ARM64 is experimental: built here, not yet run on hardware.
+      - run: cargo build --release --locked -p hidshim-cli --target aarch64-pc-windows-msvc
 
       - name: Package
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          New-Item -ItemType Directory dist, drivers-zip | Out-Null
+          New-Item -ItemType Directory dist, drivers-zip, drivers-arm64-zip | Out-Null
           Copy-Item target/release/hidshim.exe dist/
+          Copy-Item target/aarch64-pc-windows-msvc/release/hidshim.exe dist/hidshim-arm64.exe
           Copy-Item target/drivers/xusb/hidshimxusb.dll, target/drivers/xusb/hidshimxusb.inf, LICENSE drivers-zip/
           Compress-Archive drivers-zip/* dist/hidshim-drivers.zip
+          Copy-Item target/drivers/xusb-arm64/hidshimxusb.dll, target/drivers/xusb-arm64/hidshimxusb.inf, LICENSE drivers-arm64-zip/
+          Compress-Archive drivers-arm64-zip/* dist/hidshim-drivers-arm64.zip
           Get-ChildItem dist -File | ForEach-Object {
             "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
           } | Set-Content -Encoding ascii dist/SHA256SUMS

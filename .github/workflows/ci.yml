@@ -12,6 +12,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+          targets: aarch64-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
       - uses: actions/cache@v6
         with:
@@ -19,11 +20,12 @@ jobs:
           key: wdk-${{ hashFiles('drivers/build.ps1') }}
 
       - run: cargo fmt --all --check
-      - run: ./drivers/build.ps1
+      - run: ./drivers/build.ps1 -Arch x64, arm64
         shell: pwsh
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       # The client alone must build without the driver.
       - run: cargo check -p hidshim --locked
+      - run: cargo build --locked -p hidshim-cli --target aarch64-pc-windows-msvc
       - run: cargo test --workspace --locked
       # The tests in crates/sdk/tests stay manual: the INF names xinputhid as a
       # filter, and Windows Server has no such service, so the pads never start
