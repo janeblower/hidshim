@@ -557,21 +557,23 @@ static VOID HandleWaitForInput(PAD_CTX *ctx, WDFREQUEST Request)
     NTSTATUS status;
 
     /* Pending under the lock: a report published in between would
-     * otherwise leave this request parked until the next change. Waiting
-     * goes up first, so the owner either sees it or wrote before the sync. */
+     * otherwise leave this request parked until the next change. */
     WdfWaitLockAcquire(ctx->Lock, NULL);
-    SetWaitingLocked(ctx, TRUE);
     SyncSharedLocked(ctx);
     if (ctx->Owner == NULL) {
         status = STATUS_DEVICE_NOT_CONNECTED;
     } else if (file != NULL && GetFileCtx(file)->SeenPacket != ctx->Packet) {
         CompleteWait(ctx, Request);
-        RefreshWaitingLocked(ctx);
         WdfWaitLockRelease(ctx->Lock);
         return;
     } else {
         status = WdfRequestForwardToIoQueue(Request, ctx->WaitQueue);
         if (NT_SUCCESS(status)) {
+            /* Waiting goes up only once the request is parked: a sync that
+             * publishes drops it. Then the owner either sees it or wrote
+             * before the second sync. */
+            SetWaitingLocked(ctx, TRUE);
+            SyncSharedLocked(ctx);
             WdfWaitLockRelease(ctx->Lock);
             return;
         }
