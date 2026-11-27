@@ -6,9 +6,17 @@ fn main() {
         return;
     }
     // Outside this repository, as in a git dependency, point at an unpacked
-    // hidshim-drivers.zip.
+    // hidshim-drivers.zip, or hidshim-drivers-arm64.zip for ARM64.
+    let folder = match std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
+        Ok("aarch64") => "xusb-arm64",
+        _ => "xusb",
+    };
     let dir = std::env::var_os("HIDSHIM_DRIVER_DIR").map_or_else(
-        || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/drivers/xusb"),
+        || {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/drivers")
+                .join(folder)
+        },
         PathBuf::from,
     );
     for file in ["hidshimxusb.dll", "hidshimxusb.inf"] {
