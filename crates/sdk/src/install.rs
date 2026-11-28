@@ -43,13 +43,17 @@ macro_rules! package {
     };
 }
 
-/// Pad, keyboard control device, keyboard HID device, in the order they are
-/// bound.
-static PACKAGES: [Package; 3] = [
-    package!("hidshimxusb", HARDWARE_ID, store::PAD_NODE_CLASS),
-    package!("hidshimkbdctl", CONTROL_HARDWARE_ID, GUID_DEVCLASS_SYSTEM),
-    package!("hidshimhid", HID_HARDWARE_ID, GUID_DEVCLASS_HIDCLASS),
-];
+static PAD: Package = package!("hidshimxusb", HARDWARE_ID, store::PAD_NODE_CLASS);
+static KEYBOARD_CONTROL: Package =
+    package!("hidshimkbdctl", CONTROL_HARDWARE_ID, GUID_DEVCLASS_SYSTEM);
+static KEYBOARD_HID: Package = package!("hidshimhid", HID_HARDWARE_ID, GUID_DEVCLASS_HIDCLASS);
+
+/// In the order they are bound.
+static PACKAGES: [&Package; 3] = [&PAD, &KEYBOARD_CONTROL, &KEYBOARD_HID];
+
+fn catalogs(packages: &[&Package]) -> Vec<String> {
+    packages.iter().map(|package| package.catalog()).collect()
+}
 
 impl Package {
     fn dll(&self) -> String {
@@ -82,7 +86,7 @@ pub fn install() -> io::Result<()> {
     uninstall()?;
 
     let stage = Stage::create()?;
-    for package in &PACKAGES {
+    for package in PACKAGES {
         for (name, bytes) in package.files() {
             stage.put(&name, bytes)?;
         }
@@ -92,7 +96,7 @@ pub fn install() -> io::Result<()> {
         let signer = sign::Signer::new()?;
         // Signing makes whatever lies in the stage trusted, so the files are
         // checked right before each catalog is built from them.
-        for package in &PACKAGES {
+        for package in PACKAGES {
             for (name, bytes) in package.files() {
                 stage.verify(&name, bytes)?;
             }
@@ -107,7 +111,7 @@ pub fn install() -> io::Result<()> {
 
     store::ensure_devices()?;
     store::ensure_keyboard_nodes()?;
-    for package in &PACKAGES {
+    for package in PACKAGES {
         store::install_driver(package.hardware_id, &stage.dir.join(package.inf()))?;
     }
     Ok(())
@@ -121,7 +125,10 @@ pub fn restore() -> io::Result<()> {
         return Ok(());
     }
     store::ensure_devices()?;
-    if store::keyboard_packaged()? {
+    if store::keyboard_packaged(
+        &catalogs(&[&KEYBOARD_CONTROL, &KEYBOARD_HID]),
+        &catalogs(&PACKAGES),
+    )? {
         store::restore_keyboard()?;
     }
     Ok(())
@@ -143,26 +150,43 @@ fn is_current() -> bool {
 }
 
 /// Removes the devnodes, the driver packages and the signing certificate.
-/// Needs administrator rights.
+/// Needs administrator rights. Every step runs even if an earlier one failed,
+/// so that a stuck pad does not leave the keyboard behind; the first error
+/// is returned.
 pub fn uninstall() -> io::Result<()> {
+    let mut first = None;
+    let mut keep = |result: io::Result<()>| {
+        if let Err(e) = result {
+            first.get_or_insert(e);
+        }
+    };
     // Without this, WGI clients holding the device veto its removal and
     // Windows asks for a reboot.
-    let attached = store::attach_devices()?;
-    for interface in device::interfaces(device::ADMIN)? {
-        interface.open()?.ioctl(IOCTL_REMOVE, &[], &mut [])?;
-    }
+    let attached = store::attach_devices().unwrap_or_else(|e| {
+        keep(Err(e));
+        Vec::new()
+    });
+    keep(remove_pads());
     // Makes the keyboard's devices fail themselves, so an owner's open handle
     // does not veto the removal. Should it not work, uninstalling the devnodes
     // below still removes them.
-    if let Some(interface) = device::keyboard(device::ADMIN)? {
+    if let Ok(Some(interface)) = device::keyboard(device::ADMIN) {
         let _ = interface
             .open()
             .and_then(|mut device| device.ioctl(kbdproto::IOCTL_REMOVE, &[], &mut []));
     }
-    store::remove_devices(attached)?;
-    store::remove_keyboard_nodes()?;
-    store::remove_packages()?;
-    sign::untrust()
+    keep(store::remove_devices(attached));
+    keep(store::remove_keyboard_nodes());
+    keep(store::remove_packages(&catalogs(&PACKAGES)));
+    keep(sign::untrust());
+    first.map_or(Ok(()), Err)
+}
+
+fn remove_pads() -> io::Result<()> {
+    for interface in device::interfaces(device::ADMIN)? {
+        interface.open()?.ioctl(IOCTL_REMOVE, &[], &mut [])?;
+    }
+    Ok(())
 }
 
 /// A fresh directory only SYSTEM and Administrators can write to.

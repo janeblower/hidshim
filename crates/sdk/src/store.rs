@@ -26,12 +26,6 @@ const LEGACY_HARDWARE_ID: &str = "ROOT\\HIDSHIM_XUSB";
 /// pads sharing one would show as one controller. Pad n uses this plus n.
 const CONTAINER_ID: u128 = 0x6a3e5f71_2c8d_4b9a_9e14_5d7c3b2a1f80;
 const PROVIDER: &str = "hidshim";
-/// Catalogs of our three packages: pad, keyboard HID device, keyboard control
-/// device.
-pub(crate) const CATALOGS: [&str; 3] = ["hidshimxusb.cat", "hidshimhid.cat", "hidshimkbdctl.cat"];
-const HID_CATALOG: &str = CATALOGS[1];
-const CONTROL_CATALOG: &str = CATALOGS[2];
-
 /// A persistent root devnode of the keyboard.
 pub(crate) struct Node {
     pub hardware_id: &'static str,
@@ -128,11 +122,11 @@ pub(crate) fn restore_keyboard() -> io::Result<()> {
 }
 
 /// Whether the keyboard's packages are in the driver store.
-pub(crate) fn keyboard_packaged() -> io::Result<bool> {
-    let catalogs: Vec<String> = our_packages()?.into_iter().map(|(_, c)| c).collect();
-    Ok([HID_CATALOG, CONTROL_CATALOG]
+pub(crate) fn keyboard_packaged(keyboard_catalogs: &[String], ours: &[String]) -> io::Result<bool> {
+    let found = our_packages(ours)?;
+    Ok(keyboard_catalogs
         .iter()
-        .all(|wanted| catalogs.iter().any(|c| c == wanted)))
+        .all(|wanted| found.iter().any(|(_, c)| c == wanted)))
 }
 
 fn create_root_node(node: &Node) -> io::Result<(DeviceSet, SP_DEVINFO_DATA)> {
@@ -382,9 +376,9 @@ pub(crate) fn current_package_dir(class: &GUID, hardware_id: &str) -> Option<Pat
     inf.parent().map(Path::to_path_buf)
 }
 
-/// Removes all our driver store packages.
-pub(crate) fn remove_packages() -> io::Result<()> {
-    for (package, _) in our_packages()? {
+/// Removes all our driver store packages, those with one of `catalogs`.
+pub(crate) fn remove_packages(catalogs: &[String]) -> io::Result<()> {
+    for (package, _) in our_packages(catalogs)? {
         let name = wide(package.file_name().unwrap());
         // SAFETY: name is NUL-terminated.
         check(unsafe { SetupUninstallOEMInfW(name.as_ptr(), SUOI_FORCEDELETE, null()) })?;
@@ -393,7 +387,7 @@ pub(crate) fn remove_packages() -> io::Result<()> {
 }
 
 /// Our packages in the driver store, with their catalog names.
-fn our_packages() -> io::Result<Vec<(PathBuf, String)>> {
+fn our_packages(catalogs: &[String]) -> io::Result<Vec<(PathBuf, String)>> {
     let windows =
         std::env::var_os("SystemRoot").ok_or_else(|| io::Error::other("SystemRoot is not set"))?;
     let mut packages = Vec::new();
@@ -406,7 +400,7 @@ fn our_packages() -> io::Result<Vec<(PathBuf, String)>> {
             .to_ascii_lowercase();
         if name.starts_with("oem")
             && name.ends_with(".inf")
-            && let Some(catalog) = our_catalog(&path)
+            && let Some(catalog) = our_catalog(&path, catalogs)
         {
             packages.push((path, catalog));
         }
@@ -415,7 +409,7 @@ fn our_packages() -> io::Result<Vec<(PathBuf, String)>> {
 }
 
 /// The catalog name of an INF of ours, lowercase.
-fn our_catalog(inf: &Path) -> Option<String> {
+fn our_catalog(inf: &Path, catalogs: &[String]) -> Option<String> {
     let path = wide(inf);
     let mut line = 0;
     // SAFETY: path is NUL-terminated; the handle is closed below.
@@ -445,7 +439,7 @@ fn our_catalog(inf: &Path) -> Option<String> {
         }
     };
     let catalog = value("CatalogFile").to_string_lossy().to_ascii_lowercase();
-    let ours = value("Provider").eq_ignore_ascii_case(PROVIDER) && CATALOGS.contains(&&*catalog);
+    let ours = value("Provider").eq_ignore_ascii_case(PROVIDER) && catalogs.contains(&catalog);
     // SAFETY: handle came from SetupOpenInfFileW.
     unsafe { SetupCloseInfFile(handle) };
     ours.then_some(catalog)
