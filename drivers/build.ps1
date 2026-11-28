@@ -53,7 +53,12 @@ $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.
 if (-not $vs) { throw 'MSVC x64 build tools not found' }
 $msvcVersion = (Get-Content (Join-Path $vs 'VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt')).Trim()
 $msvc = Join-Path $vs "VC\Tools\MSVC\$msvcVersion"
-$src = Join-Path $root 'drivers\xusb'
+# Per driver: its source folder and the libraries beyond the common ones.
+$drivers = @(
+    @{ Name = 'hidshimxusb'; Src = 'drivers\xusb'; Libs = @() }
+    @{ Name = 'hidshimhid'; Src = 'drivers\hid'; Libs = @('cfgmgr32.lib') }
+    @{ Name = 'hidshimkbdctl'; Src = 'drivers\hid'; Libs = @() }
+)
 
 foreach ($name in $Arch) {
     $t = $targets[$name]
@@ -68,7 +73,9 @@ foreach ($name in $Arch) {
         (Join-Path $sdk "Include\$kitVersion\ucrt"),
         (Join-Path $sdk "Include\$kitVersion\um"),
         (Join-Path $sdk "Include\$kitVersion\shared"),
-        (Join-Path $wdkHeaders "Include\wdf\umdf\$umdfVersion")
+        (Join-Path $wdkHeaders "Include\wdf\umdf\$umdfVersion"),
+        # hidport.h, for the HID minidriver.
+        (Join-Path $wdkHeaders "Include\$kitVersion\km")
     ) -join ';'
     $env:LIB = @(
         (Join-Path $msvc "lib\$($t.Tools)"),
@@ -79,16 +86,20 @@ foreach ($name in $Arch) {
 
     $out = Join-Path $root "target\drivers\$($t.Out)"
     New-Item -ItemType Directory -Force $out | Out-Null
-    Invoke-Tool (Join-Path $bin 'cl.exe') (@(
-        # C4324 fires inside the WDK's own wdfrequest.h.
-        '/nologo', '/c', '/W4', '/WX', '/wd4324', '/O2', '/GS', '/MT', '/Zi',
-        '/D_WIN64', '/DUNICODE', '/D_UNICODE',
-        '/DUMDF_VERSION_MAJOR=2', "/DUMDF_VERSION_MINOR=$($umdfVersion.Split('.')[1])"
-    ) + $t.Defines + @("/Fo$out\", "/Fd$out\", (Join-Path $src 'hidshimxusb.c')))
-    Invoke-Tool (Join-Path $bin 'link.exe') @(
-        '/nologo', '/DLL', "/MACHINE:$($t.Machine)", '/DEBUG', '/OPT:REF', '/OPT:ICF',
-        "/OUT:$out\hidshimxusb.dll", "/PDB:$out\hidshimxusb.pdb",
-        "$out\hidshimxusb.obj", 'WdfDriverStubUm.lib', 'ntdll.lib', 'kernel32.lib', 'advapi32.lib')
-    Copy-Item -Force (Join-Path $src 'hidshimxusb.inf') $out
+    foreach ($d in $drivers) {
+        $src = Join-Path $root $d.Src
+        Invoke-Tool (Join-Path $bin 'cl.exe') (@(
+            # C4324 fires inside the WDK's own wdfrequest.h.
+            '/nologo', '/c', '/W4', '/WX', '/wd4324', '/O2', '/GS', '/MT', '/Zi',
+            '/D_WIN64', '/DUNICODE', '/D_UNICODE',
+            '/DUMDF_VERSION_MAJOR=2', "/DUMDF_VERSION_MINOR=$($umdfVersion.Split('.')[1])"
+        ) + $t.Defines + @("/Fo$out\", "/Fd$out\$($d.Name).c.pdb", (Join-Path $src "$($d.Name).c")))
+        Invoke-Tool (Join-Path $bin 'link.exe') (@(
+            '/nologo', '/DLL', "/MACHINE:$($t.Machine)", '/DEBUG', '/OPT:REF', '/OPT:ICF',
+            "/OUT:$out\$($d.Name).dll", "/PDB:$out\$($d.Name).pdb",
+            "$out\$($d.Name).obj", 'WdfDriverStubUm.lib', 'ntdll.lib', 'kernel32.lib', 'advapi32.lib'
+        ) + $d.Libs)
+        Copy-Item -Force (Join-Path $src "$($d.Name).inf") $out
+    }
     Write-Host "Built $out"
 }

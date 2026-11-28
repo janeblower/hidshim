@@ -38,9 +38,9 @@ jobs:
           New-Item -ItemType Directory dist, drivers-zip, drivers-arm64-zip | Out-Null
           Copy-Item target/release/hidshim.exe dist/
           Copy-Item target/aarch64-pc-windows-msvc/release/hidshim.exe dist/hidshim-arm64.exe
-          Copy-Item target/drivers/xusb/hidshimxusb.dll, target/drivers/xusb/hidshimxusb.inf, LICENSE drivers-zip/
+          Copy-Item target/drivers/xusb/*.dll, target/drivers/xusb/*.inf, LICENSE drivers-zip/
           Compress-Archive drivers-zip/* dist/hidshim-drivers.zip
-          Copy-Item target/drivers/xusb-arm64/hidshimxusb.dll, target/drivers/xusb-arm64/hidshimxusb.inf, LICENSE drivers-arm64-zip/
+          Copy-Item target/drivers/xusb-arm64/*.dll, target/drivers/xusb-arm64/*.inf, LICENSE drivers-arm64-zip/
           Compress-Archive drivers-arm64-zip/* dist/hidshim-drivers-arm64.zip
           Get-ChildItem dist -File | ForEach-Object {
             "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
