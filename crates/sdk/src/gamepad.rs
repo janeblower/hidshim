@@ -4,7 +4,7 @@ use crate::proto::{
     CAP_MAP_REPORT, CAP_PAD_INFO, IOCTL_GET_PAD_INFO, IOCTL_GET_VERSION, IOCTL_SET_REPORT,
     PROTOCOL_VERSION, PadInfo, Version,
 };
-use crate::shared::{Hold, SharedReport};
+use crate::shared::SharedReport;
 use std::io;
 use std::ops::{BitOr, BitOrAssign};
 use windows_sys::Win32::Foundation::{
@@ -129,16 +129,8 @@ impl Gamepad {
     /// uninstalling; the pad is then gone for good.
     pub fn submit(&mut self, state: &State) -> io::Result<()> {
         if let Some(shared) = &mut self.shared {
-            match shared.hold() {
-                Hold::Pending => {}
-                // A device that is gone also fails a plain request.
-                Hold::Cancelled => {
-                    let alive = self.device.query::<Version>(IOCTL_GET_VERSION).is_ok();
-                    if !alive || !shared.send_hold() {
-                        return Err(removed());
-                    }
-                }
-                Hold::Ended => return Err(removed()),
+            if !shared.alive(&mut self.device) {
+                return Err(removed());
             }
             shared.write(state);
             return Ok(());

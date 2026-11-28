@@ -1,5 +1,6 @@
 //! Handles to the driver's control interfaces.
 
+use crate::kbdproto;
 use crate::proto::{CONTROL_GUID, Mapping, PadInfo, Version};
 use crate::win::{check, cr};
 use std::io;
@@ -17,6 +18,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::IO::{DeviceIoControl, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Threading::CreateEventW;
+use windows_sys::core::GUID;
 
 /// Reference strings of the control interfaces, see drivers/xusb/hidshim.h.
 pub(crate) const CONTROL: &str = "ctl";
@@ -67,6 +69,7 @@ pub(crate) trait Reply: Default {}
 impl Reply for Version {}
 impl Reply for PadInfo {}
 impl Reply for Mapping {}
+impl Reply for kbdproto::Info {}
 
 impl Device {
     fn open(path: &[u16]) -> io::Result<Self> {
@@ -141,7 +144,7 @@ impl Device {
 
 /// Present control interfaces with this reference string, by pad index.
 pub(crate) fn interfaces(reference: &str) -> io::Result<Vec<Interface>> {
-    let mut found: Vec<Interface> = paths()?
+    let mut found: Vec<Interface> = paths(&CONTROL_GUID)?
         .split(|&c| c == 0)
         .filter_map(|path| {
             let text = String::from_utf16_lossy(path);
@@ -156,6 +159,17 @@ pub(crate) fn interfaces(reference: &str) -> io::Result<Vec<Interface>> {
         .collect();
     found.sort_by_key(|interface| interface.index);
     Ok(found)
+}
+
+/// The keyboard's control interface with this reference string, if present.
+pub(crate) fn keyboard(reference: &str) -> io::Result<Option<Interface>> {
+    Ok(paths(&kbdproto::CONTROL_GUID)?
+        .split(|&c| c == 0)
+        .find(|path| has_reference(&String::from_utf16_lossy(path), reference))
+        .map(|path| Interface {
+            index: 0,
+            path: path.iter().copied().chain(Some(0)).collect(),
+        }))
 }
 
 fn has_reference(path: &str, reference: &str) -> bool {
@@ -176,15 +190,15 @@ fn pad_index(path: &str) -> Option<u8> {
     digits.parse().ok()
 }
 
-/// The present interface list of the control GUID, NUL-separated.
-fn paths() -> io::Result<Vec<u16>> {
+/// The present interface list of a control GUID, NUL-separated.
+fn paths(guid: &GUID) -> io::Result<Vec<u16>> {
     loop {
         let mut len = 0;
         // SAFETY: out-pointer to a local.
         cr(unsafe {
             CM_Get_Device_Interface_List_SizeW(
                 &mut len,
-                &CONTROL_GUID,
+                guid,
                 null(),
                 CM_GET_DEVICE_INTERFACE_LIST_PRESENT,
             )
@@ -193,7 +207,7 @@ fn paths() -> io::Result<Vec<u16>> {
         // SAFETY: list holds len characters.
         let status = unsafe {
             CM_Get_Device_Interface_ListW(
-                &CONTROL_GUID,
+                guid,
                 null(),
                 list.as_mut_ptr(),
                 len,

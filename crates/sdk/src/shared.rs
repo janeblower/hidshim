@@ -2,8 +2,9 @@
 
 use crate::device::{self, Device};
 use crate::gamepad::State;
-use crate::proto::{IOCTL_HOLD, IOCTL_MAP_REPORT, Mapping, Shared};
+use crate::proto::{IOCTL_GET_VERSION, IOCTL_HOLD, IOCTL_MAP_REPORT, Mapping, Shared, Version};
 use std::io;
+use std::marker::PhantomData;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{Ordering, fence};
@@ -27,28 +28,45 @@ pub(crate) enum Hold {
     Ended,
 }
 
-#[derive(Debug)]
-pub(crate) struct SharedReport {
-    view: *mut Shared,
+/// The pad's section, which holds the last report.
+pub(crate) type SharedReport = Section<Shared>;
+
+/// A section of type `T` mapped from the driver, with the request that keeps
+/// the claim alive.
+pub(crate) struct Section<T> {
+    view: *mut T,
     wake: OwnedHandle,
     /// IOCTL_HIDSHIM_HOLD, pending until the pad is lost. Boxed and freed by
     /// hand: the kernel writes it while this value moves around.
     hold: *mut OVERLAPPED,
     /// The event of hold, closed only after it.
     _hold_done: OwnedHandle,
-    /// Borrowed from the Gamepad, which drops this value before its Device.
+    /// Borrowed from the owner of the claim, which drops this value before its
+    /// Device.
     device: HANDLE,
+    _marker: PhantomData<T>,
+}
+
+impl<T> std::fmt::Debug for Section<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Section").finish_non_exhaustive()
+    }
 }
 
 // SAFETY: the view and the OVERLAPPED belong to this value alone; the handles
 // work from any thread. Every method takes &mut self.
-unsafe impl Send for SharedReport {}
-unsafe impl Sync for SharedReport {}
+unsafe impl<T> Send for Section<T> {}
+unsafe impl<T> Sync for Section<T> {}
 
-impl SharedReport {
+impl<T> Section<T> {
     pub(crate) fn new(device: &mut Device) -> io::Result<Self> {
+        let mapping = device.query(IOCTL_MAP_REPORT)?;
+        Self::with_mapping(device, mapping)
+    }
+
+    /// Takes over the handles of an IOCTL_HIDSHIM_MAP_REPORT reply.
+    pub(crate) fn with_mapping(device: &mut Device, mapping: Mapping) -> io::Result<Self> {
         let hold_done = device::event()?;
-        let mapping: Mapping = device.query(IOCTL_MAP_REPORT)?;
         // SAFETY: the driver put these handles into this process for us alone.
         let (section, wake) = unsafe {
             (
@@ -63,7 +81,7 @@ impl SharedReport {
                 FILE_MAP_WRITE,
                 0,
                 0,
-                size_of::<Shared>(),
+                size_of::<T>(),
             )
         };
         if view.Value.is_null() {
@@ -75,9 +93,12 @@ impl SharedReport {
             hold: Box::into_raw(Box::new(device::overlapped(&hold_done))),
             _hold_done: hold_done,
             device: device.raw(),
+            _marker: PhantomData,
         };
         if !shared.send_hold() {
-            return Err(io::Error::other("the hidshim driver did not hold the pad"));
+            return Err(io::Error::other(
+                "the hidshim driver did not hold the claim",
+            ));
         }
         Ok(shared)
     }
@@ -119,6 +140,33 @@ impl SharedReport {
         }
     }
 
+    /// The mapped section.
+    pub(crate) fn view(&self) -> *mut T {
+        self.view
+    }
+
+    /// Wakes the driver, which waits for a report.
+    pub(crate) fn wake(&self) {
+        // SAFETY: an event handle with EVENT_MODIFY_STATE. A failure only
+        // delays the report until the next poll.
+        unsafe { SetEvent(self.wake.as_raw_handle()) };
+    }
+
+    /// Whether the claim is alive, renewing the hold when Windows cancelled
+    /// it. False once the device is gone for good.
+    pub(crate) fn alive(&mut self, device: &mut Device) -> bool {
+        match self.hold() {
+            Hold::Pending => true,
+            // A device that is gone also fails a plain request.
+            Hold::Cancelled => {
+                device.query::<Version>(IOCTL_GET_VERSION).is_ok() && self.send_hold()
+            }
+            Hold::Ended => false,
+        }
+    }
+}
+
+impl Section<Shared> {
     pub(crate) fn write(&mut self, state: &State) {
         // SAFETY: view maps a whole Shared for as long as self lives. Only
         // the atomics are borrowed; the report is written through a pointer.
@@ -132,14 +180,12 @@ impl SharedReport {
         // Pairs with the driver's barrier after it sets waiting.
         fence(Ordering::SeqCst);
         if waiting.load(Ordering::Relaxed) != 0 {
-            // SAFETY: an event handle with EVENT_MODIFY_STATE. A failure only
-            // delays the report until the next poll.
-            unsafe { SetEvent(self.wake.as_raw_handle()) };
+            self.wake();
         }
     }
 }
 
-impl Drop for SharedReport {
+impl<T> Drop for Section<T> {
     fn drop(&mut self) {
         let mut returned = 0;
         // SAFETY: device is still open (see the field); hold is the request

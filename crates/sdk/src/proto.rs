@@ -10,10 +10,10 @@ use std::sync::atomic::AtomicU32;
 
 const FILE_DEVICE_UNKNOWN: u32 = 0x22;
 const METHOD_BUFFERED: u32 = 0;
-const FILE_ANY_ACCESS: u32 = 0;
-const FILE_WRITE_ACCESS: u32 = 2;
+pub(crate) const FILE_ANY_ACCESS: u32 = 0;
+pub(crate) const FILE_WRITE_ACCESS: u32 = 2;
 
-const fn ctl_code(function: u32, access: u32) -> u32 {
+pub(crate) const fn ctl_code(function: u32, access: u32) -> u32 {
     (FILE_DEVICE_UNKNOWN << 16) | (access << 14) | (function << 2) | METHOD_BUFFERED
 }
 

@@ -1,4 +1,4 @@
-//! Virtual Xbox 360 pad for XInput and Windows.Gaming.Input, backed by a
+//! Virtual Xbox 360 pad and HID keyboard for XInput and Windows.Gaming.Input, backed by a
 //! user-mode driver.
 //!
 //! [`Gamepad::open`] needs no elevation: it claims one of the installed pads,
@@ -12,8 +12,11 @@ mod device;
 mod gamepad;
 #[cfg(feature = "install")]
 mod install;
+mod kbdproto;
+mod keyboard;
 mod pnp;
 mod proto;
+mod ring;
 mod shared;
 #[cfg(feature = "install")]
 mod sign;
@@ -24,4 +27,5 @@ mod win;
 pub use gamepad::{Buttons, Gamepad, Pad, State, pads};
 #[cfg(feature = "install")]
 pub use install::{install, restore, uninstall};
+pub use keyboard::{Keyboard, KeyboardInfo, KeyboardState, Keys, Mouse, consumer, usage};
 pub use pnp::{Status, status};

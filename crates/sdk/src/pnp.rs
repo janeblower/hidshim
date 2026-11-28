@@ -5,6 +5,7 @@ use std::io;
 use std::ptr::{null, null_mut};
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::*;
 use windows_sys::Win32::Foundation::{ERROR_NO_MORE_ITEMS, GetLastError, INVALID_HANDLE_VALUE};
+use windows_sys::core::GUID;
 
 pub(crate) const HARDWARE_ID: &str = "SWD\\HIDSHIM_XUSB";
 
@@ -24,14 +25,15 @@ fn devinfo() -> SP_DEVINFO_DATA {
     }
 }
 
-/// Devnodes carrying one of our hardware IDs; with `DIGCF_PRESENT` only
+/// Devnodes of a setup class carrying one of our hardware IDs; with `DIGCF_PRESENT` only
 /// those present now.
 pub(crate) fn our_devices(
+    class: &GUID,
     ids: &[&str],
     flags: SETUP_DI_GET_CLASS_DEVS_FLAGS,
 ) -> io::Result<(DeviceSet, Vec<SP_DEVINFO_DATA>)> {
     // SAFETY: plain query; the handle is owned by DeviceSet.
-    let set = unsafe { SetupDiGetClassDevsW(&GUID_DEVCLASS_SYSTEM, null(), null_mut(), flags) };
+    let set = unsafe { SetupDiGetClassDevsW(class, null(), null_mut(), flags) };
     if set == INVALID_HANDLE_VALUE as HDEVINFO {
         return Err(io::Error::last_os_error());
     }
@@ -92,9 +94,14 @@ pub fn status() -> io::Result<Status> {
     if !device::interfaces(device::CONTROL)?.is_empty() {
         return Ok(Status::Ready);
     }
-    Ok(if our_devices(&[HARDWARE_ID], 0)?.1.is_empty() {
-        Status::NotInstalled
-    } else {
-        Status::NotPresent
-    })
+    Ok(
+        if our_devices(&GUID_DEVCLASS_SYSTEM, &[HARDWARE_ID], 0)?
+            .1
+            .is_empty()
+        {
+            Status::NotInstalled
+        } else {
+            Status::NotPresent
+        },
+    )
 }
