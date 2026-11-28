@@ -121,6 +121,8 @@ struct HID_CTX {
     BOOLEAN Stopping;
     BOOLEAN FailDevice;
     ULONG Generation;
+    LONG Sending;
+    HANDLE SendIdle;
     WDFREQUEST Attach;
     WDFMEMORY AttachIn;
     WDFMEMORY AttachOut;
@@ -183,7 +185,9 @@ NTSTATUS HidDeviceAdd(_In_ WDFDRIVER Driver, _Inout_ PWDFDEVICE_INIT DeviceInit)
     ctx->SettleTimer = CreateThreadpoolTimer(SettleFired, ctx, NULL);
     ctx->RetryTimer = CreateThreadpoolTimer(RetryFired, ctx, NULL);
     ctx->ConnectWork = CreateThreadpoolWork(ConnectRun, ctx, NULL);
-    if (ctx->SettleTimer == NULL || ctx->RetryTimer == NULL || ctx->ConnectWork == NULL) {
+    ctx->SendIdle = CreateEventW(NULL, TRUE, TRUE, NULL);
+    if (ctx->SettleTimer == NULL || ctx->RetryTimer == NULL || ctx->ConnectWork == NULL
+        || ctx->SendIdle == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     return STATUS_SUCCESS;
@@ -239,7 +243,9 @@ static BOOLEAN TakeReportLocked(HID_CTX *ctx)
     }
     if (ctx->Mapping == NULL) return FALSE;
     shared = ctx->Mapping->View;
-    for (;;) {
+    /* Bounded: a writer filling slots with bad report IDs as fast as they
+     * are skipped must not hold the lock forever. */
+    for (int pass = 0; pass < HIDSHIM_KBD_SLOTS; pass++) {
         ULONG head = (ULONG)ReadAcquire((volatile LONG *)&shared->Head);
         UCHAR slot[sizeof(HIDSHIM_KBD_SLOT)];
         ULONG length;
@@ -262,6 +268,7 @@ static BOOLEAN TakeReportLocked(HID_CTX *ctx)
             return TRUE;
         }
     }
+    return FALSE;
 }
 
 /* Caller holds ctx->Lock. One report per read, the next only after hidclass
@@ -379,13 +386,19 @@ static MAPPING *ReleaseLocked(HID_CTX *ctx)
     return old;
 }
 
+/* Nothing is scheduled once Stopping is set: cleanup stops the timers and
+ * waits for the work after that, and a late arm would outlive them. */
 static VOID ScheduleConnect(HID_CTX *ctx, DWORD delayMs)
 {
-    if (delayMs == 0) {
-        SubmitThreadpoolWork(ctx->ConnectWork);
-    } else {
-        StartTimer(ctx->RetryTimer, delayMs);
+    WdfWaitLockAcquire(ctx->Lock, NULL);
+    if (!ctx->Stopping) {
+        if (delayMs == 0) {
+            SubmitThreadpoolWork(ctx->ConnectWork);
+        } else {
+            StartTimer(ctx->RetryTimer, delayMs);
+        }
     }
+    WdfWaitLockRelease(ctx->Lock);
 }
 
 static VOID CALLBACK RetryFired(PTP_CALLBACK_INSTANCE Instance, PVOID Context, PTP_TIMER Timer)
@@ -395,7 +408,30 @@ static VOID CALLBACK RetryFired(PTP_CALLBACK_INSTANCE Instance, PVOID Context, P
     ScheduleConnect(Context, 0);
 }
 
-static NTSTATUS SendAttach(HID_CTX *ctx)
+/* Caller holds ctx->Lock. While Sending is non-zero, ConnectRun does not
+ * delete the target or the ATTACH request. */
+static VOID EnterSendLocked(HID_CTX *ctx)
+{
+    if (ctx->Sending++ == 0) ResetEvent(ctx->SendIdle);
+}
+
+/* Caller holds ctx->Lock. */
+static VOID LeaveSendLocked(HID_CTX *ctx)
+{
+    if (--ctx->Sending == 0) SetEvent(ctx->SendIdle);
+}
+
+/* Caller holds ctx->Lock. The target is captured here: ConnectRun clears
+ * ctx->Target before it waits for the send to finish. */
+static BOOLEAN BeginSendLocked(HID_CTX *ctx, WDFIOTARGET *target)
+{
+    if (ctx->Target == NULL || ctx->TargetDead || ctx->Stopping) return FALSE;
+    EnterSendLocked(ctx);
+    *target = ctx->Target;
+    return TRUE;
+}
+
+static NTSTATUS SendAttach(HID_CTX *ctx, WDFIOTARGET target)
 {
     WDF_REQUEST_REUSE_PARAMS reuse;
     NTSTATUS status;
@@ -404,27 +440,55 @@ static NTSTATUS SendAttach(HID_CTX *ctx)
     if (!NT_SUCCESS(status)) return status;
     *(ULONG *)WdfMemoryGetBuffer(ctx->AttachIn, NULL) = ctx->Generation;
     status = WdfIoTargetFormatRequestForIoctl(
-        ctx->Target, ctx->Attach, IOCTL_HIDSHIM_KBD_ATTACH, ctx->AttachIn, NULL, ctx->AttachOut, NULL);
+        target, ctx->Attach, IOCTL_HIDSHIM_KBD_ATTACH, ctx->AttachIn, NULL, ctx->AttachOut, NULL);
     if (!NT_SUCCESS(status)) return status;
     WdfRequestSetCompletionRoutine(ctx->Attach, AttachCompleted, ctx);
-    if (!WdfRequestSend(ctx->Attach, ctx->Target, WDF_NO_SEND_OPTIONS)) {
+    if (!WdfRequestSend(ctx->Attach, target, WDF_NO_SEND_OPTIONS)) {
         return WdfRequestGetStatus(ctx->Attach);
     }
     return STATUS_SUCCESS;
+}
+
+/* After BeginSendLocked, without ctx->Lock held: the request may complete
+ * inline, and its completion takes the lock. */
+static VOID SendAttachOrDrop(HID_CTX *ctx, WDFIOTARGET target)
+{
+    NTSTATUS status = SendAttach(ctx, target);
+    MAPPING *released = NULL;
+    WdfWaitLockAcquire(ctx->Lock, NULL);
+    if (!NT_SUCCESS(status)) {
+        released = ReleaseLocked(ctx);
+        PumpLocked(ctx);
+        ctx->TargetDead = TRUE;
+    }
+    LeaveSendLocked(ctx);
+    WdfWaitLockRelease(ctx->Lock);
+    DestroyMapping(released);
+    if (!NT_SUCCESS(status)) ScheduleConnect(ctx, RETRY_MS / 5);
+}
+
+/* The control device's handles in this process, for a reply not applied. */
+static VOID CloseReplyHandles(const HIDSHIM_KBD_ATTACH *reply)
+{
+    if (!(reply->Flags & HIDSHIM_KBD_OWNED)) return;
+    if (reply->Section != 0) CloseHandle((HANDLE)(ULONG_PTR)reply->Section);
+    if (reply->Event != 0) CloseHandle((HANDLE)(ULONG_PTR)reply->Event);
 }
 
 /* Caller holds ctx->Lock. Returns the mapping to destroy. */
 static MAPPING *ApplyAttachLocked(HID_CTX *ctx, const HIDSHIM_KBD_ATTACH *reply)
 {
     MAPPING *old = NULL;
-    HANDLE section = (HANDLE)(ULONG_PTR)reply->Section;
-    HANDLE event = (HANDLE)(ULONG_PTR)reply->Event;
-    if (reply->Generation == ctx->Generation) return NULL;
+    if (reply->Generation == ctx->Generation) {
+        CloseReplyHandles(reply);
+        return NULL;
+    }
     ctx->Generation = reply->Generation;
     old = ReleaseLocked(ctx);
     ctx->Tail = 0;
     if (reply->Flags & HIDSHIM_KBD_OWNED) {
-        ctx->Mapping = CreateMapping(ctx, section, event);
+        ctx->Mapping = CreateMapping(
+            ctx, (HANDLE)(ULONG_PTR)reply->Section, (HANDLE)(ULONG_PTR)reply->Event);
         if (ctx->Mapping != NULL) SetThreadpoolWait(ctx->Mapping->Wait, ctx->Mapping->Event, NULL);
     }
     if (reply->Flags & HIDSHIM_KBD_REMOVING) ctx->FailDevice = TRUE;
@@ -437,38 +501,39 @@ VOID AttachCompleted(
 {
     HID_CTX *ctx = Context;
     NTSTATUS status = Params->IoStatus.Status;
-    MAPPING *old = NULL, *released = NULL;
+    /* Only a full reply is trusted to hold handles; a short one is ignored
+     * whole, handle values included. */
+    BOOLEAN full = NT_SUCCESS(status) && Params->IoStatus.Information == sizeof(HIDSHIM_KBD_ATTACH);
+    HIDSHIM_KBD_ATTACH reply;
+    MAPPING *old = NULL;
     BOOLEAN again = FALSE, fail = FALSE;
+    WDFIOTARGET next = NULL;
     UNREFERENCED_PARAMETER(Request);
     UNREFERENCED_PARAMETER(Target);
 
+    RtlZeroMemory(&reply, sizeof(reply));
+    if (full) reply = *(const HIDSHIM_KBD_ATTACH *)WdfMemoryGetBuffer(ctx->AttachOut, NULL);
     WdfWaitLockAcquire(ctx->Lock, NULL);
-    if (NT_SUCCESS(status) && Params->IoStatus.Information == sizeof(HIDSHIM_KBD_ATTACH) && !ctx->Stopping) {
-        HIDSHIM_KBD_ATTACH reply = *(const HIDSHIM_KBD_ATTACH *)WdfMemoryGetBuffer(ctx->AttachOut, NULL);
+    EnterSendLocked(ctx);
+    if (full && !ctx->Stopping) {
         old = ApplyAttachLocked(ctx, &reply);
         fail = ctx->FailDevice;
-        again = !fail;
+        again = !fail && BeginSendLocked(ctx, &next);
     } else {
+        if (full) CloseReplyHandles(&reply);
         /* The control device is gone or failed us: as good as a release. */
         old = ReleaseLocked(ctx);
         PumpLocked(ctx);
         ctx->TargetDead = TRUE;
     }
-    if (again) {
-        status = SendAttach(ctx);
-        if (!NT_SUCCESS(status)) {
-            released = ReleaseLocked(ctx);
-            PumpLocked(ctx);
-            ctx->TargetDead = TRUE;
-            again = FALSE;
-        }
-    }
+    LeaveSendLocked(ctx);
     WdfWaitLockRelease(ctx->Lock);
     DestroyMapping(old);
-    DestroyMapping(released);
     if (fail) {
         WdfDeviceSetFailed(ctx->Device, WdfDeviceFailedNoRestart);
-    } else if (!again && !ctx->Stopping) {
+    } else if (again) {
+        SendAttachOrDrop(ctx, next);
+    } else {
         /* The target is closed and deleted outside its own completion. */
         ScheduleConnect(ctx, RETRY_MS / 5);
     }
@@ -553,7 +618,7 @@ static VOID CALLBACK ConnectRun(PTP_CALLBACK_INSTANCE Instance, PVOID Context, P
     HID_CTX *ctx = Context;
     WDFIOTARGET dead = NULL, target = NULL;
     WCHAR path[512];
-    NTSTATUS status;
+    BOOLEAN connect, send;
     UNREFERENCED_PARAMETER(Instance);
     UNREFERENCED_PARAMETER(Work);
 
@@ -562,38 +627,42 @@ static VOID CALLBACK ConnectRun(PTP_CALLBACK_INSTANCE Instance, PVOID Context, P
     if (ctx->TargetDead || ctx->Stopping) {
         dead = ctx->Target;
         ctx->Target = NULL;
-        ctx->Attach = NULL;
         ctx->TargetDead = FALSE;
     }
-    BOOLEAN connect = ctx->Target == NULL && !ctx->Stopping;
+    connect = ctx->Target == NULL && !ctx->Stopping;
     WdfWaitLockRelease(ctx->Lock);
     if (dead != NULL) {
+        /* Close cancels the pending ATTACH; a completion or send still
+         * running holds Sending until it is done with the request. */
         WdfIoTargetClose(dead);
+        WaitForSingleObject(ctx->SendIdle, INFINITE);
         WdfObjectDelete(dead);
+        ctx->Attach = NULL;
     }
 
     if (connect && FindControl(path, ARRAYSIZE(path))) {
-        status = OpenTarget(ctx, path, &target);
-        if (NT_SUCCESS(status)) {
+        if (NT_SUCCESS(OpenTarget(ctx, path, &target))) {
             WdfWaitLockAcquire(ctx->Lock, NULL);
             ctx->Target = target;
             /* No generation the control device can have: the first answer
              * comes at once, whatever it held before. */
             ctx->Generation = 0xFFFFFFFF;
-            status = ctx->Stopping ? STATUS_CANCELLED : SendAttach(ctx);
-            if (!NT_SUCCESS(status)) {
-                ctx->Target = NULL;
-                ctx->Attach = NULL;
-            }
+            send = BeginSendLocked(ctx, &target);
+            if (!send) ctx->Target = NULL;
             WdfWaitLockRelease(ctx->Lock);
-            if (!NT_SUCCESS(status)) {
+            if (send) {
+                SendAttachOrDrop(ctx, target);
+            } else {
                 WdfIoTargetClose(target);
                 WdfObjectDelete(target);
+                ctx->Attach = NULL;
             }
+        } else {
+            /* The interface is there but would not open, say mid-removal:
+             * look again later rather than wait for an arrival that already
+             * happened. */
+            ScheduleConnect(ctx, RETRY_MS);
         }
-        /* The interface is there but would not open, say mid-removal: look
-         * again later rather than wait for an arrival that already happened. */
-        if (!NT_SUCCESS(status) && !ctx->Stopping) ScheduleConnect(ctx, RETRY_MS);
     }
     WdfWaitLockRelease(ctx->ConnectLock);
 }
@@ -631,13 +700,14 @@ VOID HidSelfManagedIoCleanup(_In_ WDFDEVICE Device)
     WdfWaitLockAcquire(ctx->Lock, NULL);
     ctx->Stopping = TRUE;
     WdfWaitLockRelease(ctx->Lock);
+    /* From here nothing arms a timer or submits the work. */
     if (ctx->Notification != NULL) CM_Unregister_Notification(ctx->Notification);
-    StopTimer(ctx->RetryTimer);
-    StopTimer(ctx->SettleTimer);
     WaitForThreadpoolWorkCallbacks(ctx->ConnectWork, FALSE);
     /* One more pass closes the target; its pending ATTACH completes
-     * cancelled and schedules nothing while Stopping. */
+     * cancelled and schedules nothing. */
     ConnectRun(NULL, ctx, NULL);
+    StopTimer(ctx->RetryTimer);
+    StopTimer(ctx->SettleTimer);
     WaitForThreadpoolWorkCallbacks(ctx->ConnectWork, FALSE);
 
     WdfWaitLockAcquire(ctx->Lock, NULL);
@@ -648,6 +718,7 @@ VOID HidSelfManagedIoCleanup(_In_ WDFDEVICE Device)
     CloseThreadpoolTimer(ctx->RetryTimer);
     CloseThreadpoolTimer(ctx->SettleTimer);
     CloseThreadpoolWork(ctx->ConnectWork);
+    CloseHandle(ctx->SendIdle);
 }
 
 /* hidclass sends its first reads again after the device powers up. */
@@ -672,7 +743,7 @@ static VOID HandleReadReport(HID_CTX *ctx, WDFREQUEST Request)
         if (ctx->Settled) {
             ctx->Armed = TRUE;
             PumpLocked(ctx);
-        } else if (!ctx->SettleStarted) {
+        } else if (!ctx->SettleStarted && !ctx->Stopping) {
             ctx->SettleStarted = TRUE;
             StartTimer(ctx->SettleTimer, SETTLE_MS);
         }
