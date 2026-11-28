@@ -92,12 +92,16 @@ NTSTATUS CtlDeviceAdd(_In_ WDFDRIVER Driver, _Inout_ PWDFDEVICE_INIT DeviceInit)
     if (!NT_SUCCESS(status)) return status;
 
     WDF_IO_QUEUE_CONFIG queueConfig;
+    /* Not power-managed: a powered-down queue would hold the ATTACH answer
+     * to an owner's cleanup, and the HID side would keep its keys down. */
     WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&queueConfig, WdfIoQueueDispatchParallel);
+    queueConfig.PowerManaged = WdfFalse;
     queueConfig.EvtIoDeviceControl = CtlIoControl;
     status = WdfIoQueueCreate(device, &queueConfig, WDF_NO_OBJECT_ATTRIBUTES, WDF_NO_HANDLE);
     if (!NT_SUCCESS(status)) return status;
 
     WDF_IO_QUEUE_CONFIG_INIT(&queueConfig, WdfIoQueueDispatchManual);
+    queueConfig.PowerManaged = WdfFalse;
     status = WdfIoQueueCreate(device, &queueConfig, WDF_NO_OBJECT_ATTRIBUTES, &ctx->HoldQueue);
     if (!NT_SUCCESS(status)) return status;
     status = WdfIoQueueCreate(device, &queueConfig, WDF_NO_OBJECT_ATTRIBUTES, &ctx->AttachQueue);
@@ -399,9 +403,12 @@ static VOID CompleteWithData(WDFREQUEST Request, const VOID *data, size_t len)
     WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, len);
 }
 
+/* The claim stays with the process that opened it: a handle inherited by or
+ * duplicated into another process, say a Medium child, gets nothing. */
 static BOOLEAN IsOwnerLocked(CTL_CTX *ctx, WDFREQUEST Request)
 {
-    return ctx->Owner != NULL && ctx->Owner == WdfRequestGetFileObject(Request);
+    return ctx->Owner != NULL && ctx->Owner == WdfRequestGetFileObject(Request)
+        && WdfRequestGetRequestorProcessId(Request) == ctx->OwnerProcessId;
 }
 
 typedef struct {
@@ -532,7 +539,8 @@ static VOID HandleAttach(CTL_CTX *ctx, WDFREQUEST Request)
         return;
     }
     WdfWaitLockAcquire(ctx->Lock, NULL);
-    if (ctx->Hid == NULL || ctx->Hid != WdfRequestGetFileObject(Request)) {
+    if (ctx->Hid == NULL || ctx->Hid != WdfRequestGetFileObject(Request)
+        || WdfRequestGetRequestorProcessId(Request) != ctx->HidProcessId) {
         status = STATUS_ACCESS_DENIED;
     } else if (*seen != ctx->Generation) {
         AnswerAttachLocked(ctx, Request);
