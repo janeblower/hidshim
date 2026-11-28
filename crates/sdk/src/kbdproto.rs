@@ -1,7 +1,9 @@
 //! Mirror of drivers/hid/hidshimkbd.h. The IOCTLs that the keyboard's control
 //! device shares with the pad's (version, map, hold) are taken from `proto`.
 
-use crate::proto::{FILE_ANY_ACCESS, FILE_WRITE_ACCESS, ctl_code};
+#[cfg(feature = "install")]
+use crate::proto::FILE_WRITE_ACCESS;
+use crate::proto::{FILE_ANY_ACCESS, ctl_code};
 use std::sync::atomic::AtomicU32;
 use windows_sys::core::GUID;
 
@@ -9,6 +11,7 @@ pub(crate) const PROTOCOL_VERSION: u32 = 1;
 pub(crate) const CONTROL_GUID: GUID = GUID::from_u128(0x428da1f6_1bfe_4c29_9bb4_d6aa00b39a4b);
 
 /// Hardware IDs of the two root devnodes.
+#[cfg(feature = "install")]
 pub(crate) const HID_HARDWARE_ID: &str = "ROOT\\HIDSHIM_KBD";
 pub(crate) const CONTROL_HARDWARE_ID: &str = "ROOT\\HIDSHIM_KBDCTL";
 
