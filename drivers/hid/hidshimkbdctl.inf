@@ -1,0 +1,73 @@
+;
+; hidshim keyboard control device
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4D36E97D-E325-11CE-BFC1-08002BE10318}
+Provider    = %ProviderName%
+CatalogFile = hidshimkbdctl.cat
+DriverVer   = 11/28/2026,0.4.1.0
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+hidshimkbdctl.dll = 1
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTamd64,NTarm64
+
+[Standard.NTamd64]
+%DeviceDesc% = Ctl_Install, ROOT\HIDSHIM_KBDCTL
+
+[Standard.NTarm64]
+%DeviceDesc% = Ctl_Install, ROOT\HIDSHIM_KBDCTL
+
+[Ctl_Install.NT]
+CopyFiles = Ctl_CopyFiles
+
+[Ctl_CopyFiles]
+hidshimkbdctl.dll
+
+[Ctl_Install.NT.HW]
+AddReg = Ctl_HW_AddReg
+
+[Ctl_HW_AddReg]
+; Whoever drives the keyboard can confirm UAC, so a Medium process gets no
+; access at all. UD (USER MODE DRIVERS) is only in WUDFHost tokens, for the
+; HID minidriver; the driver checks every open on top of this.
+HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;UD)"
+
+[Ctl_Install.NT.Services]
+AddService = WUDFRd,0x000001fa,WUDFRD_Service
+
+[WUDFRD_Service]
+DisplayName   = %WudfRdDesc%
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %10%\System32\Drivers\WUDFRd.sys
+
+[Ctl_Install.NT.Wdf]
+UmdfService                = hidshimkbdctl, Ctl_UmdfService
+UmdfServiceOrder           = hidshimkbdctl
+UmdfFileObjectPolicy       = AllowNullAndUnknownFileObjects
+UmdfKernelModeClientPolicy = AllowKernelModeClients
+UmdfImpersonationLevel     = Impersonation
+
+[Ctl_UmdfService]
+UmdfLibraryVersion = 2.15.0
+ServiceBinary      = %13%\hidshimkbdctl.dll
+
+[Strings]
+ProviderName     = "hidshim"
+ManufacturerName = "hidshim"
+DeviceDesc       = "hidshim keyboard control"
+DiskName         = "hidshim"
+WudfRdDesc       = "Windows Driver Foundation - User-mode Driver Framework Reflector"
