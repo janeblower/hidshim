@@ -19,7 +19,14 @@ fn main() {
         },
         PathBuf::from,
     );
-    for file in ["hidshimxusb.dll", "hidshimxusb.inf"] {
+    for file in [
+        "hidshimxusb.dll",
+        "hidshimxusb.inf",
+        "hidshimkbdctl.dll",
+        "hidshimkbdctl.inf",
+        "hidshimhid.dll",
+        "hidshimhid.inf",
+    ] {
         let path = dir.join(file);
         println!("cargo:rerun-if-changed={}", path.display());
         if !path.exists() {

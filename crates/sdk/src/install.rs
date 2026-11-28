@@ -1,4 +1,6 @@
 use crate::device;
+use crate::kbdproto::{self, CONTROL_HARDWARE_ID, HID_HARDWARE_ID};
+use crate::pnp::HARDWARE_ID;
 use crate::pnp::{Status, status};
 use crate::proto::IOCTL_REMOVE;
 use crate::win::{check, wide};
@@ -8,70 +10,136 @@ use std::hash::BuildHasher;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
+use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
+    GUID_DEVCLASS_HIDCLASS, GUID_DEVCLASS_SYSTEM,
+};
 use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, LocalFree};
 use windows_sys::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
-use windows_sys::core::w;
+use windows_sys::core::{GUID, w};
 
-const DRIVER: &str = "hidshimxusb.dll";
-const INF: &str = "hidshimxusb.inf";
-static DRIVER_BYTES: &[u8] =
-    include_bytes!(concat!(env!("HIDSHIM_DRIVER_DIR"), "/hidshimxusb.dll"));
-static INF_BYTES: &[u8] = include_bytes!(concat!(env!("HIDSHIM_DRIVER_DIR"), "/hidshimxusb.inf"));
+/// One driver package: `<name>.dll` and `<name>.inf`, bound to the devnodes
+/// with `hardware_id`.
+struct Package {
+    name: &'static str,
+    dll: &'static [u8],
+    inf: &'static [u8],
+    hardware_id: &'static str,
+    class: GUID,
+}
 
-/// Installs or updates the driver and creates the pads' devnodes. Needs
-/// administrator rights.
+macro_rules! package {
+    ($name:literal, $hardware_id:expr, $class:expr) => {
+        Package {
+            name: $name,
+            dll: include_bytes!(concat!(env!("HIDSHIM_DRIVER_DIR"), "/", $name, ".dll")),
+            inf: include_bytes!(concat!(env!("HIDSHIM_DRIVER_DIR"), "/", $name, ".inf")),
+            hardware_id: $hardware_id,
+            class: $class,
+        }
+    };
+}
+
+/// Pad, keyboard control device, keyboard HID device, in the order they are
+/// bound.
+static PACKAGES: [Package; 3] = [
+    package!("hidshimxusb", HARDWARE_ID, store::PAD_NODE_CLASS),
+    package!("hidshimkbdctl", CONTROL_HARDWARE_ID, GUID_DEVCLASS_SYSTEM),
+    package!("hidshimhid", HID_HARDWARE_ID, GUID_DEVCLASS_HIDCLASS),
+];
+
+impl Package {
+    fn dll(&self) -> String {
+        format!("{}.dll", self.name)
+    }
+
+    fn inf(&self) -> String {
+        format!("{}.inf", self.name)
+    }
+
+    fn catalog(&self) -> String {
+        format!("{}.cat", self.name)
+    }
+
+    fn files(&self) -> [(String, &'static [u8]); 2] {
+        [(self.dll(), self.dll), (self.inf(), self.inf)]
+    }
+}
+
+/// Installs or updates the drivers of the pad and the keyboard and creates
+/// their devnodes. Needs administrator rights.
 pub fn install() -> io::Result<()> {
     if is_current() {
-        return store::ensure_devices();
+        return restore();
     }
     // The driver store keys packages by INF content and keeps an existing
     // copy, whose catalog would then be signed by a certificate no longer
-    // trusted. Removing everything first makes the new package the only one.
+    // trusted. Removing everything first makes the new packages the only
+    // ones.
     uninstall()?;
 
     let stage = Stage::create()?;
-    stage.put(DRIVER, DRIVER_BYTES)?;
-    stage.put(INF, INF_BYTES)?;
+    for package in &PACKAGES {
+        for (name, bytes) in package.files() {
+            stage.put(&name, bytes)?;
+        }
+    }
 
     let certificate = {
         let signer = sign::Signer::new()?;
         // Signing makes whatever lies in the stage trusted, so the files are
-        // checked right before the catalog is built from them.
-        stage.verify(DRIVER, DRIVER_BYTES)?;
-        stage.verify(INF, INF_BYTES)?;
-        let catalog = sign::make_catalog(&stage.dir, store::CATALOG, &[DRIVER, INF])?;
-        signer.sign(&catalog)?;
+        // checked right before each catalog is built from them.
+        for package in &PACKAGES {
+            for (name, bytes) in package.files() {
+                stage.verify(&name, bytes)?;
+            }
+            let files = [package.dll(), package.inf()];
+            let files = [files[0].as_str(), files[1].as_str()];
+            let catalog = sign::make_catalog(&stage.dir, &package.catalog(), &files)?;
+            signer.sign(&catalog)?;
+        }
         signer.certificate()
     };
     sign::trust(&certificate)?;
 
     store::ensure_devices()?;
-    store::install_driver(&stage.dir.join(INF))
+    store::ensure_keyboard_nodes()?;
+    for package in &PACKAGES {
+        store::install_driver(package.hardware_id, &stage.dir.join(package.inf()))?;
+    }
+    Ok(())
 }
 
-/// Brings the pads back after a reboot, and does nothing when the driver is
-/// not installed. Needs administrator rights.
+/// Brings the pads back after a reboot and recreates the keyboard's devnodes
+/// if they are gone, and does nothing when the driver is not installed.
+/// Needs administrator rights.
 pub fn restore() -> io::Result<()> {
     if status()? == Status::NotInstalled {
         return Ok(());
     }
-    store::ensure_devices()
+    store::ensure_devices()?;
+    if store::keyboard_packaged()? {
+        store::restore_keyboard()?;
+    }
+    Ok(())
 }
 
-/// Whether the devnodes run exactly our files from a package that still
+/// Whether every devnode runs exactly our files from a package that still
 /// verifies.
 fn is_current() -> bool {
-    let Some(dir) = store::current_package_dir() else {
-        return false;
-    };
-    let same = |name: &str, bytes: &[u8]| std::fs::read(dir.join(name)).is_ok_and(|b| b == bytes);
-    same(DRIVER, DRIVER_BYTES)
-        && same(INF, INF_BYTES)
-        && sign::verify(&dir.join(store::CATALOG)) == 0
+    PACKAGES.iter().all(|package| {
+        let Some(dir) = store::current_package_dir(&package.class, package.hardware_id) else {
+            return false;
+        };
+        let same =
+            |name: String, bytes: &[u8]| std::fs::read(dir.join(name)).is_ok_and(|b| b == bytes);
+        same(package.dll(), package.dll)
+            && same(package.inf(), package.inf)
+            && sign::verify(&dir.join(package.catalog())) == 0
+    })
 }
 
 /// Removes the devnodes, the driver packages and the signing certificate.
@@ -83,7 +151,16 @@ pub fn uninstall() -> io::Result<()> {
     for interface in device::interfaces(device::ADMIN)? {
         interface.open()?.ioctl(IOCTL_REMOVE, &[], &mut [])?;
     }
+    // Makes the keyboard's devices fail themselves, so an owner's open handle
+    // does not veto the removal. Should it not work, uninstalling the devnodes
+    // below still removes them.
+    if let Some(interface) = device::keyboard(device::ADMIN)? {
+        let _ = interface
+            .open()
+            .and_then(|mut device| device.ioctl(kbdproto::IOCTL_REMOVE, &[], &mut []));
+    }
     store::remove_devices(attached)?;
+    store::remove_keyboard_nodes()?;
     store::remove_packages()?;
     sign::untrust()
 }

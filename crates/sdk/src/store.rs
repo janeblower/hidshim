@@ -1,6 +1,7 @@
 //! The pad's software device and the driver packages behind it.
 
-use crate::pnp::{HARDWARE_ID, first_string, our_devices};
+use crate::kbdproto::{CONTROL_HARDWARE_ID, HID_HARDWARE_ID};
+use crate::pnp::{DeviceSet, HARDWARE_ID, first_string, our_devices};
 use crate::win::{check, cr, hr, wide};
 use std::ffi::{OsString, c_void};
 use std::io;
@@ -25,7 +26,33 @@ const LEGACY_HARDWARE_ID: &str = "ROOT\\HIDSHIM_XUSB";
 /// pads sharing one would show as one controller. Pad n uses this plus n.
 const CONTAINER_ID: u128 = 0x6a3e5f71_2c8d_4b9a_9e14_5d7c3b2a1f80;
 const PROVIDER: &str = "hidshim";
-pub(crate) const CATALOG: &str = "hidshimxusb.cat";
+/// Catalogs of our three packages: pad, keyboard HID device, keyboard control
+/// device.
+pub(crate) const CATALOGS: [&str; 3] = ["hidshimxusb.cat", "hidshimhid.cat", "hidshimkbdctl.cat"];
+const HID_CATALOG: &str = CATALOGS[1];
+const CONTROL_CATALOG: &str = CATALOGS[2];
+
+/// A persistent root devnode of the keyboard.
+pub(crate) struct Node {
+    pub hardware_id: &'static str,
+    pub class: GUID,
+}
+
+/// The control device comes first; the HID device finds it either way, but
+/// then has nothing to wait for.
+pub(crate) const KEYBOARD_NODES: [Node; 2] = [
+    Node {
+        hardware_id: CONTROL_HARDWARE_ID,
+        class: GUID_DEVCLASS_SYSTEM,
+    },
+    Node {
+        hardware_id: HID_HARDWARE_ID,
+        class: GUID_DEVCLASS_HIDCLASS,
+    },
+];
+
+/// The pad's devnodes are software devices of the system class.
+pub(crate) const PAD_NODE_CLASS: GUID = GUID_DEVCLASS_SYSTEM;
 
 /// Creates the pads' software devnodes, which outlive this process but not a
 /// reboot: after one they stay registered yet absent until created again.
@@ -62,10 +89,117 @@ pub(crate) fn attach_devices() -> io::Result<Vec<SoftwareDevice>> {
 pub(crate) fn remove_devices(attached: Vec<SoftwareDevice>) -> io::Result<()> {
     drop(attached);
     wait_gone()?;
-    let (set, devices) = our_devices(&[HARDWARE_ID, LEGACY_HARDWARE_ID], 0)?;
+    let (set, devices) = our_devices(&PAD_NODE_CLASS, &[HARDWARE_ID, LEGACY_HARDWARE_ID], 0)?;
     for data in devices {
         // SAFETY: data belongs to set.
         check(unsafe { DiUninstallDevice(null_mut(), set.0, &data, 0, null_mut()) })?;
+    }
+    Ok(())
+}
+
+/// Creates the keyboard's root devnodes that are missing, without a driver.
+/// Returns the new ones with the sets that hold them.
+fn create_keyboard_nodes() -> io::Result<Vec<(DeviceSet, SP_DEVINFO_DATA)>> {
+    let mut created = Vec::new();
+    for node in &KEYBOARD_NODES {
+        let (_set, existing) = our_devices(&node.class, &[node.hardware_id], 0)?;
+        if existing.is_empty() {
+            created.push(create_root_node(node)?);
+        }
+    }
+    Ok(created)
+}
+
+/// Creates the missing keyboard devnodes; `install_driver` binds them next.
+pub(crate) fn ensure_keyboard_nodes() -> io::Result<()> {
+    create_keyboard_nodes().map(drop)
+}
+
+/// Recreates missing keyboard devnodes and lets Windows pick their driver
+/// from the driver store.
+pub(crate) fn restore_keyboard() -> io::Result<()> {
+    for (set, data) in create_keyboard_nodes()? {
+        let mut reboot = 0;
+        // SAFETY: data belongs to set; no driver is named, so the best one
+        // in the store is installed.
+        check(unsafe { DiInstallDevice(null_mut(), set.0, &data, null(), 0, &mut reboot) })?;
+    }
+    Ok(())
+}
+
+/// Whether the keyboard's packages are in the driver store.
+pub(crate) fn keyboard_packaged() -> io::Result<bool> {
+    let catalogs: Vec<String> = our_packages()?.into_iter().map(|(_, c)| c).collect();
+    Ok([HID_CATALOG, CONTROL_CATALOG]
+        .iter()
+        .all(|wanted| catalogs.iter().any(|c| c == wanted)))
+}
+
+fn create_root_node(node: &Node) -> io::Result<(DeviceSet, SP_DEVINFO_DATA)> {
+    // SAFETY: the list is owned by DeviceSet.
+    let set = unsafe { SetupDiCreateDeviceInfoList(&node.class, null_mut()) };
+    if set == INVALID_HANDLE_VALUE as HDEVINFO {
+        return Err(io::Error::last_os_error());
+    }
+    let set = DeviceSet(set);
+    let mut data = SP_DEVINFO_DATA {
+        cbSize: size_of::<SP_DEVINFO_DATA>() as u32,
+        ..Default::default()
+    };
+    // Named after the hardware ID, not the class: with DICD_GENERATE_ID the
+    // class name would give ROOT\HIDCLASS\0000, like a foreign HID device.
+    let name = wide(node.hardware_id.trim_start_matches("ROOT\\"));
+    // SAFETY: name is NUL-terminated and data sized.
+    check(unsafe {
+        SetupDiCreateDeviceInfoW(
+            set.0,
+            name.as_ptr(),
+            &node.class,
+            null(),
+            null_mut(),
+            DICD_GENERATE_ID,
+            &mut data,
+        )
+    })?;
+    // A multi-string: the ID and a second terminator.
+    let ids = wide(node.hardware_id)
+        .into_iter()
+        .chain(Some(0))
+        .collect::<Vec<u16>>();
+    // SAFETY: the buffer size is passed in bytes.
+    check(unsafe {
+        SetupDiSetDeviceRegistryPropertyW(
+            set.0,
+            &mut data,
+            SPDRP_HARDWAREID,
+            ids.as_ptr().cast(),
+            (ids.len() * 2) as u32,
+        )
+    })?;
+    // SAFETY: data belongs to set.
+    check(unsafe { SetupDiCallClassInstaller(DIF_REGISTERDEVICE, set.0, &data) })?;
+    Ok((set, data))
+}
+
+/// Uninstalls the keyboard's devnodes, the HID device first. PnP may still
+/// be tearing them down after the driver failed them, so a refusal is tried
+/// again for a while.
+pub(crate) fn remove_keyboard_nodes() -> io::Result<()> {
+    for node in KEYBOARD_NODES.iter().rev() {
+        let (set, devices) = our_devices(&node.class, &[node.hardware_id], 0)?;
+        for data in devices {
+            let start = Instant::now();
+            loop {
+                // SAFETY: data belongs to set.
+                let removed =
+                    check(unsafe { DiUninstallDevice(null_mut(), set.0, &data, 0, null_mut()) });
+                match removed {
+                    Err(e) if start.elapsed() > Duration::from_secs(10) => return Err(e),
+                    Err(_) => std::thread::sleep(Duration::from_millis(100)),
+                    Ok(()) => break,
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -76,7 +210,7 @@ fn instance(index: u8) -> String {
 
 /// Instance names, such as `XUSB0`, of our software devnodes.
 fn instances(flags: SETUP_DI_GET_CLASS_DEVS_FLAGS) -> io::Result<Vec<String>> {
-    let (_set, devices) = our_devices(&[HARDWARE_ID], flags)?;
+    let (_set, devices) = our_devices(&PAD_NODE_CLASS, &[HARDWARE_ID], flags)?;
     devices
         .iter()
         .map(|data| {
@@ -187,8 +321,8 @@ unsafe extern "system" fn on_created(
 }
 
 /// Adds the package to the driver store and binds it to the devnode.
-pub(crate) fn install_driver(inf: &Path) -> io::Result<()> {
-    let id = wide(HARDWARE_ID);
+pub(crate) fn install_driver(hardware_id: &str, inf: &Path) -> io::Result<()> {
+    let id = wide(hardware_id);
     let inf = wide(inf);
     let mut reboot = 0;
     // SAFETY: strings are NUL-terminated.
@@ -204,8 +338,8 @@ pub(crate) fn install_driver(inf: &Path) -> io::Result<()> {
 }
 
 /// The driver store package the devnode runs, such as `oem12.inf`.
-fn current_package() -> Option<String> {
-    let (_set, devices) = our_devices(&[HARDWARE_ID], 0).ok()?;
+fn current_package(class: &GUID, hardware_id: &str) -> Option<String> {
+    let (_set, devices) = our_devices(class, &[hardware_id], 0).ok()?;
     let mut buf = [0u16; 64];
     let mut size = size_of_val(&buf) as u32;
     let mut kind: DEVPROPTYPE = 0;
@@ -225,8 +359,8 @@ fn current_package() -> Option<String> {
 }
 
 /// The driver store directory of the package the devnode runs.
-pub(crate) fn current_package_dir() -> Option<PathBuf> {
-    let name = wide(current_package()?);
+pub(crate) fn current_package_dir(class: &GUID, hardware_id: &str) -> Option<PathBuf> {
+    let name = wide(current_package(class, hardware_id)?);
     let mut buf = [0u16; 512];
     // SAFETY: the buffer size is passed in characters.
     let ok = unsafe {
@@ -250,7 +384,7 @@ pub(crate) fn current_package_dir() -> Option<PathBuf> {
 
 /// Removes all our driver store packages.
 pub(crate) fn remove_packages() -> io::Result<()> {
-    for package in our_packages()? {
+    for (package, _) in our_packages()? {
         let name = wide(package.file_name().unwrap());
         // SAFETY: name is NUL-terminated.
         check(unsafe { SetupUninstallOEMInfW(name.as_ptr(), SUOI_FORCEDELETE, null()) })?;
@@ -258,7 +392,8 @@ pub(crate) fn remove_packages() -> io::Result<()> {
     Ok(())
 }
 
-fn our_packages() -> io::Result<Vec<PathBuf>> {
+/// Our packages in the driver store, with their catalog names.
+fn our_packages() -> io::Result<Vec<(PathBuf, String)>> {
     let windows =
         std::env::var_os("SystemRoot").ok_or_else(|| io::Error::other("SystemRoot is not set"))?;
     let mut packages = Vec::new();
@@ -269,20 +404,24 @@ fn our_packages() -> io::Result<Vec<PathBuf>> {
             .unwrap()
             .to_string_lossy()
             .to_ascii_lowercase();
-        if name.starts_with("oem") && name.ends_with(".inf") && is_ours(&path) {
-            packages.push(path);
+        if name.starts_with("oem")
+            && name.ends_with(".inf")
+            && let Some(catalog) = our_catalog(&path)
+        {
+            packages.push((path, catalog));
         }
     }
     Ok(packages)
 }
 
-fn is_ours(inf: &Path) -> bool {
+/// The catalog name of an INF of ours, lowercase.
+fn our_catalog(inf: &Path) -> Option<String> {
     let path = wide(inf);
     let mut line = 0;
     // SAFETY: path is NUL-terminated; the handle is closed below.
     let handle = unsafe { SetupOpenInfFileW(path.as_ptr(), null(), INF_STYLE_WIN4, &mut line) };
     if handle == INVALID_HANDLE_VALUE {
-        return false;
+        return None;
     }
     let value = |key: &str| {
         let key = wide(key);
@@ -305,11 +444,11 @@ fn is_ours(inf: &Path) -> bool {
             OsString::from_wide(&buf[..buf.iter().position(|&c| c == 0).unwrap_or(0)])
         }
     };
-    let ours = value("Provider").eq_ignore_ascii_case(PROVIDER)
-        && value("CatalogFile").eq_ignore_ascii_case(CATALOG);
+    let catalog = value("CatalogFile").to_string_lossy().to_ascii_lowercase();
+    let ours = value("Provider").eq_ignore_ascii_case(PROVIDER) && CATALOGS.contains(&&*catalog);
     // SAFETY: handle came from SetupOpenInfFileW.
     unsafe { SetupCloseInfFile(handle) };
-    ours
+    ours.then_some(catalog)
 }
 
 #[cfg(test)]
