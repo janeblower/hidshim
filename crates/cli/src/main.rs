@@ -5,10 +5,11 @@ use windows::Gaming::Input::Gamepad as WgiGamepad;
 use windows_sys::Win32::UI::Input::XboxController::{XINPUT_STATE, XInputGetState};
 
 mod autostart;
+mod keyboard;
 mod setup;
 mod window;
 
-const USAGE: &str = "usage: hidshim <command>
+const USAGE_HEAD: &str = "usage: hidshim <command>
 
   install [--no-autostart]
                    install or update hidshim and its driver, or bring the
@@ -20,14 +21,17 @@ const USAGE: &str = "usage: hidshim <command>
   autostart [on|off]
                    whether the pads come back on boot, or turn that on or
                    off (asks for administrator rights)
-  status           whether the driver is installed and the pads are running
+  status           whether the drivers are installed and the pads and the
+                   keyboard are running
   list             the pads and the processes holding them
   pad [seconds]    hold a pad and play a test pattern (default 30)
   watch [seconds]  print what XInput and Windows.Gaming.Input see (default 30)
-  bench [count]    latency from submit to XInputGetState (default 1000)";
+  bench [count]    latency from submit to XInputGetState (default 1000)
+{KBD}";
 
 #[derive(Debug, PartialEq)]
 enum Command {
+    Kbd(keyboard::Kbd),
     Install { autostart: bool },
     Uninstall,
     Autostart(Option<bool>),
@@ -45,6 +49,9 @@ fn parse(args: &[String]) -> Option<Command> {
         None => Some(default),
         Some(text) => text.parse().ok(),
     };
+    if args.first() == Some(&"kbd") {
+        return keyboard::parse(&args[1..]).map(Command::Kbd);
+    }
     if args.len() > 2 {
         return None;
     }
@@ -75,7 +82,7 @@ fn parse(args: &[String]) -> Option<Command> {
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let Some(command) = parse(&args) else {
-        eprintln!("{USAGE}");
+        eprintln!("{}", USAGE_HEAD.replace("{KBD}", keyboard::USAGE));
         std::process::exit(2);
     };
     let result = match command {
@@ -91,6 +98,7 @@ fn main() {
         Command::Pad(duration) => pad(duration),
         Command::Watch(duration) => watch(duration),
         Command::Bench(count) => bench(count),
+        Command::Kbd(command) => keyboard::run(command),
     };
     if let Err(e) = result {
         eprintln!("error: {e}");
@@ -110,13 +118,14 @@ fn elevated(run: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
 
 fn status() -> io::Result<()> {
     println!(
-        "{}",
+        "pads: {}",
         match hidshim::status()? {
             Status::NotInstalled => "not installed",
-            Status::NotPresent => "installed, pads not running (run install to bring them back)",
+            Status::NotPresent => "installed, not running (run install to bring them back)",
             Status::Ready => "ready",
         }
     );
+    println!("{}", keyboard::status_line()?);
     Ok(())
 }
 
