@@ -27,5 +27,5 @@ mod win;
 pub use gamepad::{Buttons, Gamepad, Pad, State, pads};
 #[cfg(feature = "install")]
 pub use install::{install, restore, uninstall};
-pub use keyboard::{Keyboard, KeyboardInfo, KeyboardState, Keys, Mouse, consumer, usage};
+pub use keyboard::{Keyboard, KeyboardInfo, KeyboardState, Keys, button, consumer, usage};
 pub use pnp::{Status, status};

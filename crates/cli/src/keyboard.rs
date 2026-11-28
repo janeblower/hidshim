@@ -1,7 +1,7 @@
 //! `hidshim kbd`: checks of the virtual keyboard.
 
 use super::{report, setup};
-use hidshim::{Keyboard, KeyboardState, Mouse, Status, consumer, usage};
+use hidshim::{Keyboard, KeyboardState, Status, consumer, usage};
 use std::time::{Duration, Instant};
 use std::{io, thread};
 
@@ -155,14 +155,15 @@ fn wheel(keyboard: &mut Keyboard, notches: i32) -> io::Result<()> {
     let mut left = notches;
     while left != 0 {
         let step = left.clamp(-127, 127);
-        let state = KeyboardState {
-            mouse: Mouse {
-                wheel: step as i8,
-                ..Mouse::default()
-            },
-            ..KeyboardState::default()
-        };
-        submit(keyboard, &state)?;
+        let start = Instant::now();
+        loop {
+            match keyboard.motion(0, 0, step as i8, 0) {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock && start.elapsed() < RING_WAIT => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                other => break other?,
+            }
+        }
         left -= step;
         thread::sleep(HOLD);
     }

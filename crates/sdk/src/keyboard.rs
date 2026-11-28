@@ -161,21 +161,8 @@ impl Keys {
     }
 }
 
-/// The mouse part of a [`KeyboardState`]: buttons are a state, the rest
-/// moves the pointer or wheel by that much with each `submit`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Mouse {
-    /// Bits 0 to 4: left, right, middle, back, forward; see the constants.
-    pub buttons: u8,
-    pub dx: i16,
-    pub dy: i16,
-    /// Positive scrolls up, away from the user.
-    pub wheel: i8,
-    /// Positive scrolls right.
-    pub hwheel: i8,
-}
-
-impl Mouse {
+/// Mouse buttons, bits of [`KeyboardState::buttons`].
+pub mod button {
     pub const LEFT: u8 = 0x01;
     pub const RIGHT: u8 = 0x02;
     pub const MIDDLE: u8 = 0x04;
@@ -183,14 +170,17 @@ impl Mouse {
     pub const FORWARD: u8 = 0x10;
 }
 
-/// Everything the virtual keyboard holds down, and what the mouse does.
+/// Everything the virtual keyboard holds down: a state, so submitting it
+/// again changes nothing. Mouse movement is not part of it, see
+/// [`Keyboard::motion`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct KeyboardState {
     pub keys: Keys,
     /// Held usages of the consumer page, `0` for an empty place. Values
     /// above `0x3FF` are treated as `0`.
     pub consumer: [u16; 4],
-    pub mouse: Mouse,
+    /// Held mouse buttons, see [`button`]; bits above the fifth are ignored.
+    pub buttons: u8,
 }
 
 /// What the driver was last given, to send only what changed.
@@ -224,14 +214,13 @@ fn clean_consumer(usages: [u16; 4]) -> [u16; 4] {
 }
 
 /// The reports that take the driver from `sent` to `state`, and the new
-/// `sent`: keyboard and consumer when they changed, the mouse when its
-/// buttons changed or it moves.
+/// `sent`: keyboard, consumer keys and mouse buttons, each when it changed.
 fn diff(sent: &Sent, state: &KeyboardState) -> (Batch, Sent) {
     let mut batch = Batch::default();
     let next = Sent {
         keys: state.keys,
         consumer: clean_consumer(state.consumer),
-        buttons: state.mouse.buttons & BUTTON_MASK,
+        buttons: state.buttons & BUTTON_MASK,
     };
     if next.keys != sent.keys {
         batch.push(keyboard_report(&next.keys));
@@ -239,9 +228,8 @@ fn diff(sent: &Sent, state: &KeyboardState) -> (Batch, Sent) {
     if next.consumer != sent.consumer {
         batch.push(consumer_report(&next.consumer));
     }
-    let m = &state.mouse;
-    if next.buttons != sent.buttons || m.dx != 0 || m.dy != 0 || m.wheel != 0 || m.hwheel != 0 {
-        batch.push(mouse_report(next.buttons, m));
+    if next.buttons != sent.buttons {
+        batch.push(mouse_report(next.buttons, Motion::default()));
     }
     (batch, next)
 }
@@ -264,7 +252,16 @@ fn consumer_report(usages: &[u16; 4]) -> Slot {
     slot
 }
 
-fn mouse_report(buttons: u8, mouse: &Mouse) -> Slot {
+/// A relative movement, as [`Keyboard::motion`] takes it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Motion {
+    dx: i16,
+    dy: i16,
+    wheel: i8,
+    hwheel: i8,
+}
+
+fn mouse_report(buttons: u8, mouse: Motion) -> Slot {
     let mut slot = [0; 32];
     slot[0] = REPORT_MOUSE;
     slot[1] = buttons;
@@ -294,7 +291,9 @@ pub struct Keyboard {
 }
 
 impl Keyboard {
-    /// Claims the keyboard. Fails with [`io::ErrorKind::NotFound`] when it is
+    /// Claims the keyboard. Blocks for up to 5 seconds while the HID side
+    /// attaches, as right after a boot or an install, so do not call it from
+    /// a UI or async thread. Fails with [`io::ErrorKind::NotFound`] when it is
     /// not running, see [`Keyboard::status`], with
     /// [`io::ErrorKind::PermissionDenied`] without SYSTEM or administrator
     /// rights, with [`io::ErrorKind::ResourceBusy`] when another process
@@ -323,39 +322,64 @@ impl Keyboard {
     }
 
     /// Makes Windows see `state`: the reports of whatever changed since the
-    /// last call, in the order keyboard, consumer keys, mouse. Windows
-    /// receives them in that order within a collection; across collections
-    /// it does not promise one, so space calls apart when it matters.
+    /// last call, in the order keyboard, consumer keys, mouse buttons.
+    /// Windows receives them in that order within a collection; across
+    /// collections it does not promise one, so space calls apart when it
+    /// matters.
     ///
     /// Fails with [`io::ErrorKind::WouldBlock`] when the driver has not taken
-    /// 64 reports yet: nothing is sent, the next call compares with the same
-    /// state as this one did, and this call's mouse movement is lost. Fails
-    /// with [`io::ErrorKind::NotConnected`] once the keyboard was removed or
-    /// its HID side went away; open it again.
+    /// 64 reports yet: nothing is sent and the next call compares with the
+    /// same state as this one did. Fails with [`io::ErrorKind::NotConnected`]
+    /// once the keyboard was removed or its HID side went away; open it
+    /// again.
     pub fn submit(&mut self, state: &KeyboardState) -> io::Result<()> {
+        let (batch, next) = diff(&self.sent, state);
+        self.send(&batch)?;
+        self.sent = next;
+        Ok(())
+    }
+
+    /// Moves the pointer by `dx`, `dy` and scrolls the wheel up by `wheel`
+    /// and right by `hwheel`, in one report with the buttons held now. All
+    /// zero sends nothing. Errors as [`Keyboard::submit`]; the movement of a
+    /// failed call is lost.
+    pub fn motion(&mut self, dx: i16, dy: i16, wheel: i8, hwheel: i8) -> io::Result<()> {
+        let motion = Motion {
+            dx,
+            dy,
+            wheel,
+            hwheel,
+        };
+        if motion == Motion::default() {
+            return Ok(());
+        }
+        let mut batch = Batch::default();
+        batch.push(mouse_report(self.sent.buttons, motion));
+        self.send(&batch)
+    }
+
+    fn send(&mut self, batch: &Batch) -> io::Result<()> {
         if !self.section.alive(&mut self.device) {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "the hidshim keyboard was removed",
             ));
         }
-        let (batch, next) = diff(&self.sent, state);
-        if batch.len > 0 {
-            // SAFETY: the view maps a whole Shared, and this value is its
-            // only writer.
-            let wake =
-                unsafe { ring::publish(self.section.view(), &mut self.head, batch.as_slice()) }
-                    .map_err(|ring::Full| {
-                        io::Error::new(
-                            io::ErrorKind::WouldBlock,
-                            "the hidshim keyboard has 64 reports Windows has not read",
-                        )
-                    })?;
-            if wake {
-                self.section.wake();
-            }
+        if batch.len == 0 {
+            return Ok(());
         }
-        self.sent = next;
+        // SAFETY: the view maps a whole Shared, and this value is its only
+        // writer.
+        let wake = unsafe { ring::publish(self.section.view(), &mut self.head, batch.as_slice()) }
+            .map_err(|ring::Full| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "the hidshim keyboard has 64 reports Windows has not read",
+                )
+            })?;
+        if wake {
+            self.section.wake();
+        }
         Ok(())
     }
 
@@ -518,35 +542,47 @@ mod tests {
     }
 
     #[test]
-    fn mouse_report_follows_the_descriptor() {
+    fn button_report_follows_the_descriptor() {
         let state = KeyboardState {
-            mouse: Mouse {
-                buttons: Mouse::LEFT | Mouse::FORWARD | 0xE0,
+            buttons: button::LEFT | button::FORWARD | 0xE0,
+            ..KeyboardState::default()
+        };
+        let (out, _) = reports(&Sent::default(), &state);
+        assert_eq!(out, vec![vec![3, 0x11, 0, 0, 0, 0, 0, 0]]);
+    }
+
+    #[test]
+    fn motion_report_follows_the_descriptor() {
+        let slot = mouse_report(
+            button::RIGHT,
+            Motion {
                 dx: -2,
                 dy: 0x0102,
                 wheel: -1,
                 hwheel: 5,
             },
-            ..KeyboardState::default()
-        };
-        let (out, _) = reports(&Sent::default(), &state);
-        assert_eq!(out, vec![vec![3, 0x11, 0xFE, 0xFF, 0x02, 0x01, 0xFF, 5]]);
+        );
+        assert_eq!(
+            slot[..MOUSE_LEN],
+            [3, 0x02, 0xFE, 0xFF, 0x02, 0x01, 0xFF, 5]
+        );
     }
 
     #[test]
     fn axes_stay_inside_the_declared_range() {
-        let state = KeyboardState {
-            mouse: Mouse {
+        let slot = mouse_report(
+            0,
+            Motion {
                 dx: i16::MIN,
                 dy: i16::MIN,
                 wheel: i8::MIN,
                 hwheel: i8::MIN,
-                ..Mouse::default()
             },
-            ..KeyboardState::default()
-        };
-        let (out, _) = reports(&Sent::default(), &state);
-        assert_eq!(out, vec![vec![3, 0, 0x01, 0x80, 0x01, 0x80, 0x81, 0x81]]);
+        );
+        assert_eq!(
+            slot[..MOUSE_LEN],
+            [3, 0, 0x01, 0x80, 0x01, 0x80, 0x81, 0x81]
+        );
     }
 
     #[test]
@@ -565,7 +601,7 @@ mod tests {
     fn only_the_changed_parts_are_sent() {
         let mut held = state(&[usage::A]);
         held.consumer[0] = consumer::MUTE;
-        held.mouse.buttons = Mouse::RIGHT;
+        held.buttons = button::RIGHT;
         let (first, sent) = reports(&Sent::default(), &held);
         assert_eq!(ids(&first), [1, 2, 3]);
 
@@ -578,21 +614,21 @@ mod tests {
         let (out, sent) = reports(&sent, &next);
         assert_eq!(ids(&out), [2]);
 
-        next.mouse.buttons = 0;
+        next.buttons = 0;
         let (out, _) = reports(&sent, &next);
         assert_eq!(ids(&out), [3]);
     }
 
     #[test]
-    fn movement_is_sent_every_time_and_buttons_only_on_change() {
-        let mut state = KeyboardState::default();
-        state.mouse.wheel = 1;
-        let (out, sent) = reports(&Sent::default(), &state);
-        assert_eq!(out.len(), 1);
-        let (out, sent) = reports(&sent, &state);
-        assert_eq!(out.len(), 1);
-        state.mouse.wheel = 0;
-        assert!(reports(&sent, &state).0.is_empty());
+    fn resubmitting_a_state_never_moves_the_pointer() {
+        let held = KeyboardState {
+            buttons: button::LEFT,
+            ..KeyboardState::default()
+        };
+        let (_, sent) = reports(&Sent::default(), &held);
+        for _ in 0..3 {
+            assert!(reports(&sent, &held).0.is_empty());
+        }
     }
 
     #[test]

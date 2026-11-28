@@ -53,8 +53,10 @@ impl<T> std::fmt::Debug for Section<T> {
     }
 }
 
-// SAFETY: the view and the OVERLAPPED belong to this value alone; the handles
-// work from any thread. Every method takes &mut self.
+// SAFETY: the view and the OVERLAPPED belong to this value alone and the
+// handles work from any thread. The only methods taking &self, view() and
+// wake(), hand out a pointer and call SetEvent, which is thread-safe;
+// whoever writes through the pointer must do so from one thread at a time.
 unsafe impl<T> Send for Section<T> {}
 unsafe impl<T> Sync for Section<T> {}
 
