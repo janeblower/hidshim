@@ -44,6 +44,8 @@ HKR,,"LowerFilters",0x00010008,"WUDFRd"
 ; No one but hidclass talks to the device itself; the collections get their
 ; own security from hidclass.
 HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GA;;;BA)"
+; FILE_DEVICE_SECURE_OPEN: the DACL also covers names under the device.
+HKR,,DeviceCharacteristics,0x10001,0x100
 
 [Kbd_Install.NT.Services]
 ; Explicit services rather than Include/Needs of MsHidUmdf.inf, which only

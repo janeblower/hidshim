@@ -43,6 +43,8 @@ AddReg = Ctl_HW_AddReg
 ; access at all. UD (USER MODE DRIVERS) is only in WUDFHost tokens, for the
 ; HID minidriver; the driver checks every open on top of this.
 HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;UD)"
+; FILE_DEVICE_SECURE_OPEN: the DACL also covers names under the device.
+HKR,,DeviceCharacteristics,0x10001,0x100
 
 [Ctl_Install.NT.Services]
 AddService = WUDFRd,0x000001fa,WUDFRD_Service
