@@ -1,0 +1,87 @@
+;
+; hidshim keyboard: HID minidriver under mshidumdf
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = HIDClass
+ClassGuid   = {745A17A0-74D3-11D0-B6FE-00A0C90F57DA}
+Provider    = %ProviderName%
+CatalogFile = hidshimhid.cat
+DriverVer   = 11/28/2026,0.4.1.0
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+hidshimhid.dll = 1
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTamd64,NTarm64
+
+[Standard.NTamd64]
+%DeviceDesc% = Kbd_Install, ROOT\HIDSHIM_KBD
+
+[Standard.NTarm64]
+%DeviceDesc% = Kbd_Install, ROOT\HIDSHIM_KBD
+
+[Kbd_Install.NT]
+CopyFiles = Kbd_CopyFiles
+
+[Kbd_CopyFiles]
+hidshimhid.dll
+
+[Kbd_Install.NT.HW]
+AddReg = Kbd_HW_AddReg
+
+[Kbd_HW_AddReg]
+; The reflector loads the UMDF driver below mshidumdf.
+HKR,,"LowerFilters",0x00010008,"WUDFRd"
+; No one but hidclass talks to the device itself; the collections get their
+; own security from hidclass.
+HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GA;;;BA)"
+
+[Kbd_Install.NT.Services]
+; Explicit services rather than Include/Needs of MsHidUmdf.inf, which only
+; exists from build 22000.
+AddService = mshidumdf,0x000001fa,MsHidUmdf_Service
+AddService = WUDFRd,0x000001f8,WUDFRD_Service
+
+[MsHidUmdf_Service]
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %10%\System32\Drivers\mshidumdf.sys
+
+[WUDFRD_Service]
+DisplayName   = %WudfRdDesc%
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %10%\System32\Drivers\WUDFRd.sys
+
+[Kbd_Install.NT.Wdf]
+UmdfService                = hidshimhid, Kbd_UmdfService
+UmdfServiceOrder           = hidshimhid
+UmdfKernelModeClientPolicy = AllowKernelModeClients
+UmdfFileObjectPolicy       = AllowNullAndUnknownFileObjects
+UmdfMethodNeitherAction    = Copy
+UmdfFsContextUsePolicy     = CanUseFsContext2
+; Its own host: the control device checks that the host holds this driver,
+; and a crash of anything else does not take the keyboard with it.
+UmdfHostProcessSharing     = ProcessSharingDisabled
+
+[Kbd_UmdfService]
+UmdfLibraryVersion = 2.15.0
+ServiceBinary      = %13%\hidshimhid.dll
+
+[Strings]
+ProviderName     = "hidshim"
+ManufacturerName = "hidshim"
+DeviceDesc       = "hidshim keyboard"
+DiskName         = "hidshim"
+WudfRdDesc       = "Windows Driver Foundation - User-mode Driver Framework Reflector"
